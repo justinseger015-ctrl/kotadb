@@ -60,7 +60,8 @@ export default function PricingPage() {
       period: 'forever',
       description: 'Perfect for getting started',
       features: [
-        '100 requests per hour',
+        '1,000 requests per hour',
+        '5,000 requests per day',
         'Basic code search',
         'Repository indexing',
         'Community support',
@@ -75,7 +76,8 @@ export default function PricingPage() {
       period: 'per month',
       description: 'For individual developers',
       features: [
-        '1,000 requests per hour',
+        '5,000 requests per hour',
+        '25,000 requests per day',
         'Advanced code search',
         'Unlimited repositories',
         'Priority support',
@@ -91,7 +93,8 @@ export default function PricingPage() {
       period: 'per month',
       description: 'For development teams',
       features: [
-        '10,000 requests per hour',
+        '25,000 requests per hour',
+        '100,000 requests per day',
         'Advanced code search',
         'Unlimited repositories',
         'Priority support',
@@ -146,7 +149,7 @@ export default function PricingPage() {
           {tiers.map((tier) => (
             <div
               key={tier.tier}
-              className={`bg-white dark:bg-gray-800 rounded-lg shadow-lg overflow-hidden ${
+              className={`glass-light dark:glass-dark rounded-lg shadow-lg overflow-hidden transition-all duration-200 hover:shadow-xl ${
                 tier.highlighted ? 'ring-2 ring-blue-600 transform scale-105' : ''
               }`}
             >
@@ -215,12 +218,6 @@ export default function PricingPage() {
               </div>
             </div>
           ))}
-        </div>
-
-        <div className="mt-12 text-center">
-          <p className="text-gray-600 dark:text-gray-400">
-            All plans include a 14-day free trial. Cancel anytime.
-          </p>
         </div>
       </div>
     </div>
