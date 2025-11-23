@@ -16,10 +16,6 @@
 import { parse } from "@typescript-eslint/parser";
 import type { TSESTree } from "@typescript-eslint/types";
 import { extname } from "node:path";
-import { Sentry } from "../instrument.js";
-import { createLogger } from "@logging/logger.js";
-
-const logger = createLogger({ module: "indexer-ast-parser" });
 
 /**
  * File extensions supported for AST parsing.
@@ -64,7 +60,7 @@ export function isSupportedForAST(filePath: string): boolean {
  * - Comment and token preservation (comment, tokens)
  *
  * On parse error:
- * - Logs error via structured logger with file path and message
+ * - Logs error to console.error with file path and message
  * - Returns null (does not throw)
  * - Allows indexing to continue for other files
  *
@@ -116,30 +112,7 @@ export function parseFile(
 		// Log parse error for observability
 		const message = error instanceof Error ? error.message : String(error);
 		const location = line !== undefined ? ` at line ${line}` : "";
-
-		logger.error(`Failed to parse ${filePath}${location}`, error instanceof Error ? error : undefined, {
-			file_path: filePath,
-			line_number: line,
-			column_number: column,
-			parse_error: message,
-		});
-
-		// Capture exception in Sentry
-		if (error instanceof Error) {
-			Sentry.captureException(error, {
-				tags: {
-					module: "ast-parser",
-					operation: "parse",
-				},
-				contexts: {
-					parse: {
-						file_path: filePath,
-						line_number: line,
-						column_number: column,
-					},
-				},
-			});
-		}
+		process.stderr.write(`Failed to parse ${filePath}${location}: ${message}`);
 
 		return null;
 	}

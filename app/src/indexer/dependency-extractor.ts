@@ -25,10 +25,6 @@ import type { IndexedFile } from "@shared/types/entities";
 import type { Symbol as ExtractedSymbol } from "@indexer/symbol-extractor";
 import type { Reference } from "@indexer/reference-extractor";
 import { resolveImport } from "./import-resolver";
-import { Sentry } from "../instrument.js";
-import { createLogger } from "@logging/logger.js";
-
-const logger = createLogger({ module: "indexer-dependency-extractor" });
 
 /**
  * Dependency edge in the dependency graph.
@@ -139,11 +135,9 @@ export function buildFileDependencies(
 
 		const importSource = ref.metadata.importSource;
 		if (!importSource) {
-			logger.warn("Import reference missing importSource metadata", {
-				reference_type: ref.referenceType,
-				target_name: ref.targetName,
-				line_number: ref.lineNumber,
-			});
+			process.stderr.write(
+				`Import reference missing importSource metadata: ${JSON.stringify(ref)}`,
+			);
 			continue;
 		}
 
@@ -155,10 +149,9 @@ export function buildFileDependencies(
 		});
 
 		if (!sourceFile) {
-			logger.warn("Could not find source file for import reference", {
-				line_number: ref.lineNumber,
-				import_source: importSource,
-			});
+			process.stderr.write(
+				`Could not find source file for import reference at line ${ref.lineNumber}`,
+			);
 			continue;
 		}
 
@@ -166,21 +159,18 @@ export function buildFileDependencies(
 		const resolvedPath = resolveImport(importSource, sourceFile.path, files);
 
 		if (!resolvedPath) {
-			logger.debug("Could not resolve import path", {
-				import_source: importSource,
-				from_file: sourceFile.path,
-			});
+			process.stderr.write(
+				`Could not resolve import "${importSource}" from ${sourceFile.path}`,
+			);
 			continue;
 		}
 
 		// Find the target file
 		const targetFile = fileByPath.get(resolvedPath);
 		if (!targetFile || !targetFile.id) {
-			logger.debug("Resolved import path not found in indexed files", {
-				resolved_path: resolvedPath,
-				import_source: importSource,
-				from_file: sourceFile.path,
-			});
+			process.stderr.write(
+				`Resolved import path "${resolvedPath}" not found in indexed files`,
+			);
 			continue;
 		}
 
@@ -277,19 +267,15 @@ export function buildSymbolDependencies(
 				callee = sameFileCallee;
 			} else {
 				// Ambiguous match, log and skip
-				logger.debug("Ambiguous call target with multiple matches", {
-					target_name: ref.targetName,
-					line_number: ref.lineNumber,
-					match_count: callees.length,
-				});
+				process.stderr.write(
+					`Ambiguous call target "${ref.targetName}" at line ${ref.lineNumber} (${callees.length} matches)`,
+				);
 				continue;
 			}
 		}
 
 		if (!(callee as any).id) {
-			logger.warn("Callee symbol missing id", {
-				symbol_name: callee.name,
-			});
+			process.stderr.write(`Callee symbol missing id: ${callee.name}`);
 			continue;
 		}
 

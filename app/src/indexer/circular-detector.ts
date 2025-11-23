@@ -23,10 +23,6 @@
  */
 
 import type { DependencyEdge } from "./dependency-extractor";
-import { Sentry } from "../instrument.js";
-import { createLogger } from "@logging/logger.js";
-
-const logger = createLogger({ module: "indexer-circular-detector" });
 
 /**
  * Circular dependency chain.
@@ -96,17 +92,10 @@ export function detectCircularDependencies(
 
 		for (const cycle of fileCycles) {
 			const paths = cycle.map((id) => filePathById.get(id) || id);
-			const circularChain = {
-				type: "file_import" as const,
+			cycles.push({
+				type: "file_import",
 				chain: cycle,
 				description: paths.join(" → "),
-			};
-			cycles.push(circularChain);
-
-			logger.warn("Detected circular file dependency", {
-				cycle_type: "file_import",
-				cycle_length: cycle.length,
-				cycle_description: circularChain.description,
 			});
 		}
 	}
@@ -124,17 +113,10 @@ export function detectCircularDependencies(
 
 		for (const cycle of symbolCycles) {
 			const names = cycle.map((id) => symbolNameById.get(id) || id);
-			const circularChain = {
-				type: "symbol_usage" as const,
+			cycles.push({
+				type: "symbol_usage",
 				chain: cycle,
 				description: names.join(" → "),
-			};
-			cycles.push(circularChain);
-
-			logger.warn("Detected circular symbol dependency", {
-				cycle_type: "symbol_usage",
-				cycle_length: cycle.length,
-				cycle_description: circularChain.description,
 			});
 		}
 	}

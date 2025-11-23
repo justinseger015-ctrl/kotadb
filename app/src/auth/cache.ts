@@ -6,10 +6,6 @@
  */
 
 import type { Tier } from "@shared/types/auth";
-import { Sentry } from "../instrument.js";
-import { createLogger } from "@logging/logger.js";
-
-const logger = createLogger({ module: "auth-cache" });
 
 /**
  * Cached validation result with expiry timestamp.
@@ -116,10 +112,9 @@ function cleanupExpiredEntries(): void {
 	}
 
 	if (removed > 0) {
-		logger.debug("Evicted expired cache entries", {
-			removedCount: removed,
-			cacheSize: cache.size,
-		});
+		process.stdout.write(
+			`[Cache] Evicted ${removed} expired entries (size: ${cache.size})`,
+		);
 	}
 }
 

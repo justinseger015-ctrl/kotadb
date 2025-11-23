@@ -80,17 +80,7 @@ Use this reference to decide which KotaDB application layer documentation source
     - When performing code search, dependency analysis, or issue tracking
     - When understanding performance implications of MCP calls (rate limiting, authentication overhead)
     - When needing decision matrix for task type vs recommended approach
-    - When working with kotadb-staging, kotadb-production, playwright, or sequential-thinking MCP servers
-
-- .claude/commands/docs/kotadb-agent-usage.md
-  - Conditions:
-    - When performing code discovery, dependency analysis, or impact assessment in any workflow command
-    - When planning features, bugs, chores, or refactors that require codebase exploration
-    - When understanding best practices for using KotaDB MCP tools in agent contexts
-    - When needing concrete examples for authentication, indexing, rate limiting, or validation searches
-    - When performing pre-implementation dependency checks before modifying shared modules
-    - When discovering test scope or analyzing refactor impact with dependency graphs
-    - When validating feature specs or large changes using impact analysis tools
+    - When working with kotadb, playwright, or sequential-thinking MCP servers
 
 - .claude/commands/docs/workflow.md
   - Conditions:
@@ -139,30 +129,11 @@ Use this reference to decide which KotaDB application layer documentation source
     - When debugging test environment variable loading in CI
     - When monitoring CI performance or consumption
 
-- .claude/commands/docs/automated-deployments.md
-  - Conditions:
-    - When understanding how database migrations are automatically applied via Supabase GitHub App
-    - When troubleshooting "Supabase Preview" check failures or migration conflicts
-    - When understanding automatic API deployments to Fly.io staging/production
-    - When debugging "Fly.io" check failures or deployment issues
-    - When needing to override automated deployments for emergency hotfixes
-    - When monitoring deployment history or status via GitHub checks
-    - When understanding the difference between automated and manual deployment procedures
-    - When working with PR preview branches and ephemeral database instances
-
 - app/.dockerignore
   - Conditions:
     - When working on Docker builds, Fly.io deployments, or build optimization
     - When troubleshooting Docker build context size or performance issues
     - When adding new files/directories that should be excluded from production builds
-
-- docs/specs/chore-440-sentry-logging-audit.md
-  - Conditions:
-    - When implementing error handling or debugging production issues
-    - When understanding Sentry and structured logging patterns across codebase
-    - When adding new try-catch blocks or error capture logic
-    - When troubleshooting observability infrastructure (Sentry, structured logger)
-    - When needing reference implementations for error context and correlation IDs
 
 - docs/specs/chore-195-dev-start-script.md
   - Conditions:
@@ -424,16 +395,3 @@ Use this reference to decide which KotaDB application layer documentation source
     - When enhancing output format specifications or adding CRITICAL output sections
     - When agents add explanatory text despite templates specifying "Return only X"
     - When implementing defensive parsing patterns for agent responses
-
-- .claude/commands/release/release.md
-  - Conditions:
-    - When creating a production release by merging develop → main
-    - When performing version bumping (major/minor/patch)
-    - When generating changelogs from commit history
-    - When validating pre-release checks (CI, migration sync, schema parity, health checks)
-    - When creating release PRs with comprehensive checklists
-    - When tagging releases and creating GitHub releases
-    - When syncing develop with main after release
-    - When handling emergency hotfixes from main branch
-    - When implementing rollback procedures for problematic releases
-    - When understanding semantic versioning strategy for KotaDB

@@ -6,12 +6,8 @@
  */
 
 import { Octokit } from "@octokit/rest";
-import { Sentry } from "../instrument.js";
-import { createLogger } from "@logging/logger.js";
 import { getInstallationToken } from "./app-auth";
 import type { TokenGenerationOptions } from "./types";
-
-const logger = createLogger({ module: "github-client" });
 
 /**
  * Create an authenticated Octokit REST client for a specific installation
@@ -30,28 +26,12 @@ export async function getOctokitForInstallation(
 	installationId: number,
 	options?: Omit<TokenGenerationOptions, "installationId">,
 ): Promise<Octokit> {
-	try {
-		logger.info("Creating authenticated Octokit client", {
-			installation_id: installationId,
-		});
+	const token = await getInstallationToken(installationId, options);
 
-		const token = await getInstallationToken(installationId, options);
-
-		return new Octokit({
-			auth: token,
-			userAgent: "KotaDB/1.0",
-		});
-	} catch (error) {
-		logger.error(
-			"Failed to create authenticated Octokit client",
-			error instanceof Error ? error : new Error(String(error)),
-			{
-				installation_id: installationId,
-			},
-		);
-		Sentry.captureException(error);
-		throw error;
-	}
+	return new Octokit({
+		auth: token,
+		userAgent: "KotaDB/1.0",
+	});
 }
 
 /**
@@ -65,8 +45,6 @@ export async function getOctokitForInstallation(
  * ```
  */
 export function getPublicOctokit(): Octokit {
-	logger.info("Creating public Octokit client");
-
 	return new Octokit({
 		userAgent: "KotaDB/1.0",
 	});

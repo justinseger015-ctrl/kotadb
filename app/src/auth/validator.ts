@@ -8,10 +8,6 @@ import { getCachedValidation, setCachedValidation } from "@auth/cache";
 import type { Tier } from "@shared/types/auth";
 import { getServiceClient } from "@db/client";
 import bcrypt from "bcryptjs";
-import { Sentry } from "../instrument.js";
-import { createLogger } from "@logging/logger.js";
-
-const logger = createLogger({ module: "auth-validator" });
 
 /**
  * Result of successful API key validation.
@@ -216,11 +212,11 @@ export async function validateJwtToken(
 			tier = subData.tier as Tier;
 		}
 
-		// Determine rate limit based on tier (updated in #423)
+		// Determine rate limit based on tier
 		const rateLimitMap: Record<Tier, number> = {
-			free: 1000,
-			solo: 5000,
-			team: 25000,
+			free: 100,
+			solo: 1000,
+			team: 10000,
 		};
 		const rateLimitPerHour = rateLimitMap[tier];
 
@@ -237,14 +233,9 @@ export async function validateJwtToken(
 
 		return result;
 	} catch (error) {
-		logger.error("JWT validation error", {
-			error,
-		});
-		Sentry.captureException(error as Error, {
-			extra: {
-				message: "JWT validation failed",
-			},
-		});
+		process.stderr.write(
+			`[Auth] JWT validation error: ${JSON.stringify(error)}\n`,
+		);
 		return null;
 	}
 }
@@ -264,15 +255,8 @@ export async function updateLastUsed(keyId: string): Promise<void> {
 			.eq("key_id", keyId);
 	} catch (error) {
 		// Non-critical operation - log error but don't throw
-		logger.warn("Failed to update last_used_at timestamp", {
-			keyId,
-			error,
-		});
-		Sentry.captureException(error as Error, {
-			extra: {
-				keyId,
-				message: "Failed to update last_used_at timestamp",
-			},
-		});
+		process.stderr.write(
+			`[Auth] Failed to update last_used_at for key ${keyId}: ${JSON.stringify(error)}\n`,
+		);
 	}
 }
