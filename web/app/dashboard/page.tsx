@@ -17,8 +17,9 @@ interface KeyMetadata {
 }
 
 function DashboardContent() {
-  const { user, subscription, apiKey, setApiKey, isLoading } = useAuth()
+  const { user, subscription, apiKey, setApiKey, isLoading, session } = useAuth()
   const [loadingPortal, setLoadingPortal] = useState(false)
+  const [billingError, setBillingError] = useState<string | null>(null)
   const [loadingKeyGen, setLoadingKeyGen] = useState(false)
   const [copiedKey, setCopiedKey] = useState(false)
   const [keyGenError, setKeyGenError] = useState<string | null>(null)
@@ -30,21 +31,52 @@ function DashboardContent() {
   const [showRevokeModal, setShowRevokeModal] = useState(false)
   const router = useRouter()
 
+  const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000'
+
+  // Fetch API key from localStorage if user is authenticated but context doesn't have key yet
+  useEffect(() => {
+    const fetchApiKeyFromLocalStorage = async () => {
+      if (!user || apiKey || isLoading) {
+        return
+      }
+
+      // Check localStorage for the API key secret
+      // Note: API key secrets are only shown once at generation and stored in localStorage
+      // If localStorage is cleared, users must reset their key to retrieve a new secret
+      const storedKey = localStorage.getItem('kotadb_api_key')
+      if (storedKey) {
+        setApiKey(storedKey)
+      }
+    }
+
+    fetchApiKeyFromLocalStorage()
+  }, [user, apiKey, isLoading, setApiKey])
+
   // Fetch key metadata when user is authenticated and has an API key
   useEffect(() => {
     if (user && apiKey) {
       fetchKeyMetadata()
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user, apiKey])
 
   const handleManageBilling = async () => {
+    setBillingError(null)
     setLoadingPortal(true)
+
+    if (!session?.access_token) {
+      setBillingError('Authentication failed. Please refresh and try again.')
+      process.stderr.write('No session available for billing portal request\n')
+      setLoadingPortal(false)
+      return
+    }
+
     try {
-      const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000'
       const response = await fetch(`${apiUrl}/api/subscriptions/create-portal-session`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'Authorization': `Bearer ${session.access_token}`,
         },
         body: JSON.stringify({
           returnUrl: window.location.href,
@@ -54,10 +86,19 @@ function DashboardContent() {
       if (response.ok) {
         const data: CreatePortalSessionResponse = await response.json()
         window.location.href = data.url
+      } else if (response.status === 401) {
+        setBillingError('Authentication failed. Please refresh and try again.')
+        process.stderr.write('Billing portal auth failed: 401 Unauthorized\n')
+      } else if (response.status === 404) {
+        setBillingError('No subscription found. Please contact support.')
+        process.stderr.write('Billing portal failed: No subscription found\n')
       } else {
-        process.stderr.write('Failed to create portal session\n')
+        setBillingError('Failed to open billing portal. Please try again.')
+        const errorData = await response.json().catch(() => ({}))
+        process.stderr.write(`Billing portal error: ${JSON.stringify(errorData)}\n`)
       }
     } catch (error) {
+      setBillingError('Failed to open billing portal. Please try again.')
       process.stderr.write(`Error creating portal session: ${error instanceof Error ? error.message : String(error)}\n`)
     } finally {
       setLoadingPortal(false)
@@ -70,8 +111,6 @@ function DashboardContent() {
     setKeyGenSuccess(null)
 
     try {
-      const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000'
-
       // Get the current session
       const { createClient } = await import('@/lib/supabase')
       const supabase = createClient()
@@ -104,7 +143,17 @@ function DashboardContent() {
           // Auto-refresh metadata to show new key info
           await fetchKeyMetadata()
         } else if (keyData.message?.includes('already exists')) {
-          setKeyGenError('You already have an API key. Please contact support if you need a new one.')
+          // Key already exists - fetch metadata to display it
+          setKeyGenError('You already have an API key. Fetching details...')
+          try {
+            await fetchKeyMetadata()
+            // Clear error and show success message after successful fetch
+            setKeyGenError(null)
+            setKeyGenSuccess('API key already exists and is active')
+          } catch (fetchError) {
+            // If fetch fails, update error message
+            setKeyGenError('You already have an API key. Please refresh the page to view details.')
+          }
         }
       } else {
         const errorData = await response.json() as { error?: string }
@@ -130,7 +179,6 @@ function DashboardContent() {
     setLoadingMetadata(true)
     setMetadataError(null)
     try {
-      const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000'
       const { createClient } = await import('@/lib/supabase')
       const supabase = createClient()
       const { data: { session }, error: sessionError } = await supabase.auth.getSession()
@@ -163,7 +211,6 @@ function DashboardContent() {
 
   const handleResetApiKey = async () => {
     try {
-      const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000'
       const { createClient } = await import('@/lib/supabase')
       const supabase = createClient()
       const { data: { session }, error: sessionError } = await supabase.auth.getSession()
@@ -198,7 +245,6 @@ function DashboardContent() {
 
   const handleRevokeApiKey = async () => {
     try {
-      const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000'
       const { createClient } = await import('@/lib/supabase')
       const supabase = createClient()
       const { data: { session }, error: sessionError } = await supabase.auth.getSession()
@@ -313,6 +359,12 @@ function DashboardContent() {
               )}
             </div>
 
+            {billingError && (
+              <div className="mb-4 p-3 bg-red-50 dark:bg-red-900/20 rounded-md">
+                <p className="text-sm text-red-800 dark:text-red-200">{billingError}</p>
+              </div>
+            )}
+
             {subscription ? (
               <div className="space-y-3">
                 <div className="flex items-center space-x-3">
@@ -397,7 +449,7 @@ function DashboardContent() {
             )}
 
             {/* Error Message */}
-            {keyGenError && (
+            {keyGenError && !keyMetadata && !apiKey && (
               <div className="mb-4 p-3 bg-red-50 dark:bg-red-900/20 rounded-md">
                 <p className="text-sm text-red-800 dark:text-red-200">
                   {keyGenError}

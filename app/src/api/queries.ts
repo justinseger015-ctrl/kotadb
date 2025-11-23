@@ -3,9 +3,14 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import type { Symbol as ExtractedSymbol } from "@indexer/symbol-extractor";
 import type { Reference } from "@indexer/reference-extractor";
 import { getInstallationForRepository } from "../github/installation-lookup";
+import { Sentry } from "../instrument.js";
+import { createLogger } from "@logging/logger.js";
+
+const logger = createLogger({ module: "api-queries" });
 
 export interface SearchOptions {
 	repositoryId?: string;
+	projectId?: string;
 	limit?: number;
 }
 
@@ -328,6 +333,28 @@ export async function searchFiles(
 ): Promise<IndexedFile[]> {
 	const limit = Math.min(Math.max(options.limit ?? 20, 1), 100);
 
+	// If project filter is specified, get repository IDs for that project
+	let repositoryIds: string[] | undefined;
+	if (options.projectId) {
+		const { data: projectRepos, error: projectError } = await client
+			.from("project_repositories")
+			.select("repository_id")
+			.eq("project_id", options.projectId);
+
+		if (projectError) {
+			throw new Error(
+				`Failed to fetch project repositories: ${projectError.message}`,
+			);
+		}
+
+		repositoryIds = projectRepos?.map((pr) => pr.repository_id) ?? [];
+
+		// If project has no repositories, return empty results
+		if (repositoryIds.length === 0) {
+			return [];
+		}
+	}
+
 	let query = client
 		.from("indexed_files")
 		.select("id, repository_id, path, content, metadata, indexed_at")
@@ -335,8 +362,11 @@ export async function searchFiles(
 		.order("indexed_at", { ascending: false })
 		.limit(limit);
 
+	// Apply repository filter (single repo or project's repos)
 	if (options.repositoryId) {
 		query = query.eq("repository_id", options.repositoryId);
+	} else if (repositoryIds) {
+		query = query.in("repository_id", repositoryIds);
 	}
 
 	const { data, error } = await query;
@@ -405,24 +435,28 @@ async function populateInstallationId(
 		// Parse owner and repo from full_name
 		const [owner, repo] = fullName.split("/");
 		if (!owner || !repo) {
-			process.stderr.write(
-				`[Installation Lookup] Invalid repository full_name: ${fullName}\n`,
-			);
+			logger.warn("Invalid repository full_name format", {
+				fullName,
+				repositoryId,
+			});
 			return;
 		}
 
 		// Log before lookup
-		process.stdout.write(
-			`[Installation Lookup] Starting installation_id lookup for ${fullName} (repository_id=${repositoryId})\n`,
-		);
+		logger.info("Starting installation_id lookup", {
+			fullName,
+			repositoryId,
+		});
 
 		// Query GitHub App installations to find installation_id
 		const installationId = await getInstallationForRepository(owner, repo);
 
 		// Log result of lookup
-		process.stdout.write(
-			`[Installation Lookup] Lookup result for ${fullName}: installation_id=${installationId ?? "null"}\n`,
-		);
+		logger.info("Installation lookup completed", {
+			fullName,
+			installationId: installationId ?? null,
+			found: installationId !== null,
+		});
 
 		if (installationId !== null) {
 			// Update repository with installation_id
@@ -432,24 +466,33 @@ async function populateInstallationId(
 				.eq("id", repositoryId);
 
 			if (error) {
-				process.stderr.write(
-					`[Installation Lookup] Failed to update repository ${repositoryId} with installation_id ${installationId}: ${error.message}\n`,
-				);
+				logger.error("Failed to update repository with installation_id", new Error(error.message), {
+					repositoryId,
+					installationId,
+					fullName,
+				});
+				Sentry.captureException(new Error(error.message));
 			} else {
-				process.stdout.write(
-					`[Installation Lookup] Updated repository ${fullName} with installation_id ${installationId}\n`,
-				);
+				logger.info("Repository updated with installation_id", {
+					fullName,
+					installationId,
+					repositoryId,
+				});
 			}
 		} else {
-			process.stdout.write(
-				`[Installation Lookup] No installation found for ${fullName}, will attempt unauthenticated clone\n`,
-			);
+			logger.info("No installation found, will attempt unauthenticated clone", {
+				fullName,
+				repositoryId,
+			});
 		}
 	} catch (error) {
 		// Log error but don't throw - allow repository creation to succeed
-		process.stderr.write(
-			`[Installation Lookup] Error populating installation_id for ${fullName}: ${error instanceof Error ? error.message : String(error)}\n`,
-		);
+		const err = error instanceof Error ? error : new Error(String(error));
+		logger.error("Error populating installation_id", err, {
+			fullName,
+			repositoryId,
+		});
+		Sentry.captureException(err);
 	}
 }
 
@@ -540,10 +583,35 @@ export async function runIndexingWorkflow(
 		"@indexer/circular-detector"
 	);
 
-	const repo = await prepareRepository(request);
+	// Fetch repository metadata to get installation_id for GitHub App authentication (Issue #430)
+	const { data: repoData, error: repoError } = await client
+		.from("repositories")
+		.select("installation_id")
+		.eq("id", repositoryId)
+		.single();
+
+	if (repoError) {
+		throw new Error(`Failed to fetch repository metadata: ${repoError.message}`);
+	}
+
+	const installationId = repoData?.installation_id ?? undefined;
+
+	if (installationId !== undefined) {
+		logger.info("Using installation_id for repository authentication", {
+			installationId,
+			repositoryId,
+			runId,
+		});
+	}
+
+	const repo = await prepareRepository(request, installationId);
 
 	if (!existsSync(repo.localPath)) {
-		process.stderr.write(`Indexing skipped: path ${repo.localPath} does not exist.\n`);
+		logger.warn("Indexing skipped: repository path does not exist", {
+			localPath: repo.localPath,
+			repositoryId,
+			runId,
+		});
 		await updateIndexRunStatus(client, runId, "skipped");
 		return;
 	}
@@ -582,7 +650,11 @@ export async function runIndexingWorkflow(
 				.single();
 
 			if (!fileRecord) {
-				process.stderr.write(`Could not find file record for ${file.path}\n`);
+				logger.warn("Could not find file record after indexing", {
+					filePath: file.path,
+					repositoryId,
+					runId,
+				});
 				return { symbols: 0, references: 0 };
 			}
 
@@ -642,7 +714,11 @@ export async function runIndexingWorkflow(
 	);
 
 	// Extract dependency graph from collected symbols and references
-	process.stdout.write(`Extracting dependency graph for ${filesWithId.length} files...\n`);
+	logger.info("Extracting dependency graph", {
+		fileCount: filesWithId.length,
+		repositoryId,
+		runId,
+	});
 	const dependencies = extractDependencies(
 		filesWithId,
 		allSymbolsWithFileId,
@@ -670,12 +746,15 @@ export async function runIndexingWorkflow(
 	);
 
 	if (circularChains.length > 0) {
-		process.stderr.write(
-			`Detected ${circularChains.length} circular dependency chains:\n`,
-		);
-		for (const chain of circularChains) {
-			process.stderr.write(`  [${chain.type}] ${chain.description}\n`);
-		}
+		logger.warn("Circular dependency chains detected", {
+			chainCount: circularChains.length,
+			repositoryId,
+			runId,
+			chains: circularChains.map(c => ({
+				type: c.type,
+				description: c.description,
+			})),
+		});
 	}
 
 	await updateIndexRunStatus(client, runId, "completed", undefined, {

@@ -13,12 +13,30 @@ import express, {
 	type Response,
 	type NextFunction,
 } from "express";
+import { Sentry } from "../instrument.js";
+import { createLogger } from "@logging/logger.js";
+
+const logger = createLogger({ module: "api-routes" });
 import {
 	ensureRepository,
 	listRecentFiles,
 	runIndexingWorkflow,
 	searchFiles,
 } from "./queries";
+import {
+	createProject,
+	listProjects,
+	getProject,
+	updateProject,
+	deleteProject,
+	addRepositoryToProject,
+	removeRepositoryFromProject,
+} from "./projects";
+import type {
+	CreateProjectRequest,
+	UpdateProjectRequest,
+} from "@shared/types";
+import { triggerAutoReindex } from "./auto-reindex";
 import { createIndexJob, updateJobStatus, getJobStatus } from "../queue/job-tracker";
 import {
 	verifyWebhookSignature,
@@ -37,6 +55,8 @@ import {
 	handleSubscriptionDeleted,
 } from "@api/webhooks";
 import type Stripe from "stripe";
+import { requestLoggingMiddleware, errorLoggingMiddleware } from "@logging/middleware";
+import { expressErrorHandler } from "../instrument.js";
 
 /**
  * Extended Express Request with auth context attached
@@ -45,8 +65,42 @@ interface AuthenticatedRequest extends Request {
 	authContext?: AuthContext;
 }
 
+/**
+ * Cached API version from package.json
+ */
+let apiVersion: string | null = null;
+
+/**
+ * Extract version from package.json
+ * Cached at module load to avoid repeated file reads
+ */
+async function loadApiVersion(): Promise<string> {
+	if (apiVersion !== null) {
+		return apiVersion;
+	}
+
+	try {
+		// Dynamic import with path relative to this file
+		const pkg = await import("../../package.json", { with: { type: "json" } });
+		apiVersion = pkg.default?.version || pkg.version || "unknown";
+		return apiVersion;
+	} catch (error) {
+		logger.warn("Failed to load API version from package.json", { error });
+		apiVersion = "unknown";
+		return apiVersion;
+	}
+}
+
+// Load version at module initialization
+loadApiVersion().catch(() => {
+	// Silently fail - version will default to "unknown"
+});
+
 export function createExpressApp(supabase: SupabaseClient): Express {
 	const app = express();
+
+	// Request logging middleware (before all other middleware)
+	app.use(requestLoggingMiddleware);
 
 	// CORS middleware - allow requests from web app
 	app.use(cors({
@@ -81,6 +135,7 @@ export function createExpressApp(supabase: SupabaseClient): Express {
 
 			res.json({
 				status: "ok",
+				version: apiVersion || "unknown",
 				timestamp: new Date().toISOString(),
 				queue: {
 					depth: queueInfo?.queuedCount || 0,
@@ -93,6 +148,7 @@ export function createExpressApp(supabase: SupabaseClient): Express {
 			// If queue not available, return basic health status
 			res.json({
 				status: "ok",
+				version: apiVersion || "unknown",
 				timestamp: new Date().toISOString(),
 				queue: null
 			});
@@ -122,7 +178,9 @@ export function createExpressApp(supabase: SupabaseClient): Express {
 				// Get webhook secret from environment
 				const secret = process.env.GITHUB_WEBHOOK_SECRET;
 				if (!secret) {
-					process.stderr.write("[Webhook] GITHUB_WEBHOOK_SECRET not configured\n");
+					const error = new Error("GITHUB_WEBHOOK_SECRET not configured");
+					logger.error("GitHub webhook secret missing", error);
+					Sentry.captureException(error);
 					return res.status(500).json({ error: "Webhook secret not configured" });
 				}
 
@@ -132,7 +190,10 @@ export function createExpressApp(supabase: SupabaseClient): Express {
 				// Verify signature
 				const isValid = verifyWebhookSignature(rawBody, signature, secret);
 				if (!isValid) {
-					process.stderr.write(`[Webhook] Invalid signature for delivery ${delivery}\n`);
+					logger.warn("GitHub webhook signature invalid", {
+						delivery,
+						event,
+					});
 					return res.status(401).json({ error: "Invalid signature" });
 				}
 
@@ -153,14 +214,21 @@ export function createExpressApp(supabase: SupabaseClient): Express {
 				// Process push event asynchronously (don't block webhook response)
 				if (payload) {
 					processPushEvent(payload).catch((error) => {
-						process.stderr.write(`[Webhook] Processing error: ${JSON.stringify(error)}\n`);
+						const err = error instanceof Error ? error : new Error(String(error));
+						logger.error("GitHub webhook processing error", err, {
+							event,
+							delivery,
+						});
+						Sentry.captureException(err);
 					});
 				}
 
 				// Always return success for valid webhooks (GitHub expects 200 OK)
 				res.status(200).json({ received: true });
 			} catch (error) {
-				process.stderr.write(`[Webhook] Handler error: ${JSON.stringify(error)}\n`);
+				const err = error instanceof Error ? error : new Error(String(error));
+				logger.error("GitHub webhook handler error", err);
+				Sentry.captureException(err);
 				res.status(500).json({ error: "Internal server error" });
 			}
 		},
@@ -183,7 +251,9 @@ export function createExpressApp(supabase: SupabaseClient): Express {
 				// Get webhook secret from environment
 				const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
 				if (!webhookSecret) {
-					process.stderr.write("[Stripe Webhook] STRIPE_WEBHOOK_SECRET not configured\n");
+					const error = new Error("STRIPE_WEBHOOK_SECRET not configured");
+					logger.error("Stripe webhook secret missing", error);
+					Sentry.captureException(error);
 					return res.status(500).json({ error: "Webhook secret not configured" });
 				}
 
@@ -196,68 +266,58 @@ export function createExpressApp(supabase: SupabaseClient): Express {
 					event = await verifyStripeSignature(rawBody, signature);
 				} catch (error) {
 					const err = error as Error;
-					process.stderr.write(`[Stripe Webhook] Signature verification failed: ${err.message}\n`);
+					logger.error("Stripe webhook signature verification failed", err);
+					Sentry.captureException(err);
 					return res.status(401).json({ error: "Invalid signature" });
 				}
 
 				// Log webhook event
-				process.stdout.write(
-					`[Stripe Webhook] Received event: type=${event.type}, id=${event.id}\n`,
-				);
+				logger.info("Stripe webhook received", {
+					eventType: event.type,
+					eventId: event.id,
+				});
 
 				// Route events to handlers asynchronously (don't block webhook response)
 			if (event.type === "checkout.session.completed") {
 				handleCheckoutSessionCompleted(event as Stripe.CheckoutSessionCompletedEvent).catch(
 					(error) => {
-						const errorDetails = {
-							message: error?.message || String(error),
-							stack: error?.stack,
-							name: error?.name,
-							cause: error?.cause,
-						};
-						process.stderr.write(
-							`[Stripe Webhook] checkout.session.completed handler error: ${JSON.stringify(errorDetails, null, 2)}\n`,
-						);
+						const err = error instanceof Error ? error : new Error(String(error));
+						logger.error("Stripe checkout.session.completed handler error", err, {
+							eventId: event.id,
+							eventType: event.type,
+						});
+						Sentry.captureException(err);
 					},
 				);
 			} else if (event.type === "invoice.paid") {
 					handleInvoicePaid(event as Stripe.InvoicePaidEvent).catch((error) => {
-						const errorDetails = {
-							message: error?.message || String(error),
-							stack: error?.stack,
-							name: error?.name,
-							cause: error?.cause,
-						};
-						process.stderr.write(
-							`[Stripe Webhook] invoice.paid handler error: ${JSON.stringify(errorDetails, null, 2)}\n`,
-						);
+						const err = error instanceof Error ? error : new Error(String(error));
+						logger.error("Stripe invoice.paid handler error", err, {
+							eventId: event.id,
+							eventType: event.type,
+						});
+						Sentry.captureException(err);
 					});
 				} else if (event.type === "customer.subscription.updated") {
 					handleSubscriptionUpdated(event as Stripe.CustomerSubscriptionUpdatedEvent).catch(
 						(error) => {
-							const errorDetails = {
-								message: error?.message || String(error),
-								stack: error?.stack,
-								name: error?.name,
-								cause: error?.cause,
-							};
-							process.stderr.write(
-								`[Stripe Webhook] customer.subscription.updated handler error: ${JSON.stringify(errorDetails, null, 2)}\n`,
-							);
+							const err = error instanceof Error ? error : new Error(String(error));
+							logger.error("Stripe customer.subscription.updated handler error", err, {
+								eventId: event.id,
+								eventType: event.type,
+							});
+							Sentry.captureException(err);
 						},
 					);
 				} else if (event.type === "customer.subscription.deleted") {
 					handleSubscriptionDeleted(event as Stripe.CustomerSubscriptionDeletedEvent).catch(
 						(error) => {
-							const errorDetails = {
-								message: error?.message || String(error),
-								stack: error?.stack,
-								name: error?.name,
-								cause: error?.cause,
-							};
-							process.stderr.write(
-								`[Stripe Webhook] customer.subscription.deleted handler error: ${JSON.stringify(errorDetails, null, 2)}\n`,
-							);
+							const err = error instanceof Error ? error : new Error(String(error));
+							logger.error("Stripe customer.subscription.deleted handler error", err, {
+								eventId: event.id,
+								eventType: event.type,
+							});
+							Sentry.captureException(err);
 						},
 					);
 				}
@@ -265,7 +325,9 @@ export function createExpressApp(supabase: SupabaseClient): Express {
 				// Always return success for valid webhooks (Stripe expects 200 OK)
 				res.status(200).json({ received: true });
 			} catch (error) {
-				process.stderr.write(`[Stripe Webhook] Handler error: ${JSON.stringify(error)}\n`);
+				const err = error instanceof Error ? error : new Error(String(error));
+				logger.error("Stripe webhook handler error", err);
+				Sentry.captureException(err);
 				res.status(500).json({ error: "Internal server error" });
 			}
 		},
@@ -456,20 +518,27 @@ export function createExpressApp(supabase: SupabaseClient): Express {
 					getDefaultSendOptions(),
 				);
 
-				process.stdout.write(
-					`[${new Date().toISOString()}] Enqueued index job ${job.id} for repository ${repositoryId}\n`,
-				);
+				logger.info("Index job enqueued", {
+					jobId: job.id,
+					repositoryId,
+					userId: context.userId,
+				});
 			} catch (error) {
-				const errorMsg = error instanceof Error ? error.message : String(error);
-				process.stderr.write(`Failed to enqueue job: ${errorMsg}\n`);
+				const err = error instanceof Error ? error : new Error(String(error));
+				logger.error("Failed to enqueue job", err, {
+					jobId: job.id,
+					repositoryId,
+					userId: context.userId,
+				});
+				Sentry.captureException(err);
 				// Update job status to failed since we couldn't enqueue it
 				await updateJobStatus(
 					job.id,
 					"failed",
-					{ error: `Queue error: ${errorMsg}` },
+					{ error: `Queue error: ${err.message}` },
 					context.userId,
 				);
-				throw error;
+				throw err;
 			}
 
 			addRateLimitHeaders(res, context.rateLimit);
@@ -516,11 +585,13 @@ export function createExpressApp(supabase: SupabaseClient): Express {
 		}
 
 		const repositoryId = req.query.repository as string | undefined;
+		const projectId = req.query.project_id as string | undefined;
 		const limit = req.query.limit ? Number(req.query.limit) : undefined;
 
 		try {
 			const results = await searchFiles(supabase, term, context.userId, {
 				repositoryId,
+				projectId,
 				limit,
 			});
 
@@ -612,7 +683,11 @@ export function createExpressApp(supabase: SupabaseClient): Express {
 		} catch (error) {
 			// Only send error if headers haven't been sent yet
 			if (!res.headersSent) {
-				process.stderr.write(`MCP handler error: ${JSON.stringify(error)}\n`);
+				const err = error instanceof Error ? error : new Error(String(error));
+				logger.error("MCP handler error", err, {
+					userId: context.userId,
+				});
+				Sentry.captureException(err);
 				res.status(500).json({ error: "Internal server error" });
 			}
 		}
@@ -656,7 +731,12 @@ export function createExpressApp(supabase: SupabaseClient): Express {
 				stripe = getStripeClient();
 				priceId = STRIPE_PRICE_IDS[tier as "solo" | "team"];
 			} catch (configError) {
-				process.stderr.write(`[Stripe] Configuration error: ${JSON.stringify(configError)}\n`);
+				const err = configError instanceof Error ? configError : new Error(String(configError));
+				logger.error("Stripe configuration error in checkout", err, {
+					userId: context.userId,
+					tier,
+				});
+				Sentry.captureException(err);
 				return res.status(500).json({ error: "Stripe is not configured on this server" });
 			}
 
@@ -692,7 +772,11 @@ export function createExpressApp(supabase: SupabaseClient): Express {
 
 			res.json({ url: session.url, sessionId: session.id });
 		} catch (error) {
-			process.stderr.write(`[Stripe] Checkout session error: ${JSON.stringify(error)}\n`);
+			const err = error instanceof Error ? error : new Error(String(error));
+			logger.error("Stripe checkout session creation failed", err, {
+				userId: context.userId,
+			});
+			Sentry.captureException(err);
 			res.status(500).json({ error: "Failed to create checkout session" });
 		}
 	});
@@ -726,7 +810,11 @@ export function createExpressApp(supabase: SupabaseClient): Express {
 				const { getStripeClient } = await import("./stripe");
 				stripe = getStripeClient();
 			} catch (configError) {
-				process.stderr.write(`[Stripe] Configuration error: ${JSON.stringify(configError)}\n`);
+				const err = configError instanceof Error ? configError : new Error(String(configError));
+				logger.error("Stripe configuration error in portal", err, {
+					userId: context.userId,
+				});
+				Sentry.captureException(err);
 				return res.status(500).json({ error: "Stripe is not configured on this server" });
 			}
 
@@ -737,7 +825,11 @@ export function createExpressApp(supabase: SupabaseClient): Express {
 
 			res.json({ url: session.url });
 		} catch (error) {
-			process.stderr.write(`[Stripe] Portal session error: ${JSON.stringify(error)}\n`);
+			const err = error instanceof Error ? error : new Error(String(error));
+			logger.error("Stripe portal session creation failed", err, {
+				userId: context.userId,
+			});
+			Sentry.captureException(err);
 			res.status(500).json({ error: "Failed to create portal session" });
 		}
 	});
@@ -756,7 +848,11 @@ export function createExpressApp(supabase: SupabaseClient): Express {
 
 			res.json({ subscription: subscription || null });
 		} catch (error) {
-			process.stderr.write(`[Stripe] Get subscription error: ${JSON.stringify(error)}\n`);
+			const err = error instanceof Error ? error : new Error(String(error));
+			logger.error("Get subscription failed", err, {
+				userId: context.userId,
+			});
+			Sentry.captureException(err);
 			res.status(500).json({ error: "Failed to fetch subscription" });
 		}
 	});
@@ -829,7 +925,9 @@ export function createExpressApp(supabase: SupabaseClient): Express {
 				createdAt: result.createdAt,
 			});
 		} catch (error) {
-			process.stderr.write(`[API Keys] Generation error: ${JSON.stringify(error)}\n`);
+			const err = error instanceof Error ? error : new Error(String(error));
+			logger.error("API key generation failed", err);
+			Sentry.captureException(err);
 			res.status(500).json({ error: "Failed to generate API key" });
 		}
 	});
@@ -860,7 +958,10 @@ export function createExpressApp(supabase: SupabaseClient): Express {
 				.maybeSingle();
 
 			if (queryError) {
-				process.stderr.write(`[API Keys] Query error: ${JSON.stringify(queryError)}\n`);
+				logger.error("API key query failed", new Error(queryError.message), {
+					userId: user.id,
+				});
+				Sentry.captureException(new Error(queryError.message));
 				return res.status(500).json({ error: "Failed to fetch API key metadata" });
 			}
 
@@ -877,7 +978,9 @@ export function createExpressApp(supabase: SupabaseClient): Express {
 				enabled: keyData.enabled,
 			});
 		} catch (error) {
-			process.stderr.write(`[API Keys] Get current error: ${JSON.stringify(error)}\n`);
+			const err = error instanceof Error ? error : new Error(String(error));
+			logger.error("Get API key metadata failed", err);
+			Sentry.captureException(err);
 			res.status(500).json({ error: "Failed to fetch API key metadata" });
 		}
 	});
@@ -924,15 +1027,16 @@ export function createExpressApp(supabase: SupabaseClient): Express {
 				message: "Old API key revoked, new key generated",
 			});
 		} catch (error) {
-			process.stderr.write(`[API Keys] Reset error: ${JSON.stringify(error)}\n`);
-			const errorMessage = error instanceof Error ? error.message : "Failed to reset API key";
+			const err = error instanceof Error ? error : new Error(String(error));
+			logger.error("API key reset failed", err);
+			Sentry.captureException(err);
 
 			// Return 404 if no active key exists
-			if (errorMessage.includes("No active API key found")) {
-				return res.status(404).json({ error: errorMessage });
+			if (err.message.includes("No active API key found")) {
+				return res.status(404).json({ error: err.message });
 			}
 
-			res.status(500).json({ error: errorMessage });
+			res.status(500).json({ error: err.message });
 		}
 	});
 
@@ -964,15 +1068,16 @@ export function createExpressApp(supabase: SupabaseClient): Express {
 				revokedAt: result.revokedAt,
 			});
 		} catch (error) {
-			process.stderr.write(`[API Keys] Revoke error: ${JSON.stringify(error)}\n`);
-			const errorMessage = error instanceof Error ? error.message : "Failed to revoke API key";
+			const err = error instanceof Error ? error : new Error(String(error));
+			logger.error("API key revocation failed", err);
+			Sentry.captureException(err);
 
 			// Return 404 if no active key exists
-			if (errorMessage.includes("No active API key found")) {
-				return res.status(404).json({ error: errorMessage });
+			if (err.message.includes("No active API key found")) {
+				return res.status(404).json({ error: err.message });
 			}
 
-			res.status(500).json({ error: errorMessage });
+			res.status(500).json({ error: err.message });
 		}
 	});
 
@@ -992,6 +1097,219 @@ export function createExpressApp(supabase: SupabaseClient): Express {
 			},
 		});
 	});
+
+	// ============================================================================
+	// Project Management Endpoints
+	// ============================================================================
+
+	// POST /api/projects - Create a new project
+	app.post("/api/projects", async (req: AuthenticatedRequest, res: Response) => {
+		const context = req.authContext!;
+		const payload = req.body as Partial<CreateProjectRequest>;
+
+		if (!payload?.name) {
+			addRateLimitHeaders(res, context.rateLimit);
+			return res.status(400).json({ error: "Field 'name' is required" });
+		}
+
+		try {
+			const projectId = await createProject(supabase, context.userId, {
+				name: payload.name,
+				description: payload.description,
+				repository_ids: payload.repository_ids,
+			});
+
+			addRateLimitHeaders(res, context.rateLimit);
+			res.status(201).json({ id: projectId });
+		} catch (error) {
+			addRateLimitHeaders(res, context.rateLimit);
+			const err = error as Error;
+			logger.error("Failed to create project", err);
+			Sentry.captureException(err);
+			res.status(500).json({ error: err.message });
+		}
+	});
+
+	// GET /api/projects - List all projects
+	app.get("/api/projects", async (req: AuthenticatedRequest, res: Response) => {
+		const context = req.authContext!;
+
+		try {
+			const projects = await listProjects(supabase, context.userId);
+			addRateLimitHeaders(res, context.rateLimit);
+			res.json({ projects });
+		} catch (error) {
+			addRateLimitHeaders(res, context.rateLimit);
+			const err = error as Error;
+			logger.error("Failed to list projects", err);
+			Sentry.captureException(err);
+			res.status(500).json({ error: err.message });
+		}
+	});
+
+	// GET /api/projects/:id - Get project details
+	app.get("/api/projects/:id", async (req: AuthenticatedRequest, res: Response) => {
+		const context = req.authContext!;
+		const projectId = req.params.id;
+
+		if (!projectId) {
+			addRateLimitHeaders(res, context.rateLimit);
+			return res.status(400).json({ error: "Project ID is required" });
+		}
+
+		try {
+			const project = await getProject(supabase, context.userId, projectId);
+
+			if (!project) {
+				addRateLimitHeaders(res, context.rateLimit);
+				return res.status(404).json({ error: "Project not found" });
+			}
+
+			addRateLimitHeaders(res, context.rateLimit);
+			res.json(project);
+		} catch (error) {
+			addRateLimitHeaders(res, context.rateLimit);
+			const err = error as Error;
+			logger.error("Failed to get project", err);
+			Sentry.captureException(err);
+			res.status(500).json({ error: err.message });
+		}
+	});
+
+	// PATCH /api/projects/:id - Update project
+	app.patch("/api/projects/:id", async (req: AuthenticatedRequest, res: Response) => {
+		const context = req.authContext!;
+		const projectId = req.params.id;
+		const payload = req.body as Partial<UpdateProjectRequest>;
+
+		if (!projectId) {
+			addRateLimitHeaders(res, context.rateLimit);
+			return res.status(400).json({ error: "Project ID is required" });
+		}
+
+		try {
+			await updateProject(supabase, context.userId, projectId, payload);
+			addRateLimitHeaders(res, context.rateLimit);
+			res.json({ success: true });
+		} catch (error) {
+			addRateLimitHeaders(res, context.rateLimit);
+			const err = error as Error;
+			logger.error("Failed to update project", err);
+			Sentry.captureException(err);
+			res.status(500).json({ error: err.message });
+		}
+	});
+
+	// DELETE /api/projects/:id - Delete project
+	app.delete("/api/projects/:id", async (req: AuthenticatedRequest, res: Response) => {
+		const context = req.authContext!;
+		const projectId = req.params.id;
+
+		if (!projectId) {
+			addRateLimitHeaders(res, context.rateLimit);
+			return res.status(400).json({ error: "Project ID is required" });
+		}
+
+		try {
+			await deleteProject(supabase, context.userId, projectId);
+			addRateLimitHeaders(res, context.rateLimit);
+			res.json({ success: true });
+		} catch (error) {
+			addRateLimitHeaders(res, context.rateLimit);
+			const err = error as Error;
+			logger.error("Failed to delete project", err);
+			Sentry.captureException(err);
+			res.status(500).json({ error: err.message });
+		}
+	});
+
+	// POST /api/projects/:id/repositories/:repoId - Add repository to project
+	app.post("/api/projects/:id/repositories/:repoId", async (req: AuthenticatedRequest, res: Response) => {
+		const context = req.authContext!;
+		const { id: projectId, repoId } = req.params;
+
+		if (!projectId || !repoId) {
+			addRateLimitHeaders(res, context.rateLimit);
+			return res.status(400).json({ error: "Project ID and Repository ID are required" });
+		}
+
+		try {
+			await addRepositoryToProject(supabase, context.userId, projectId, repoId);
+			addRateLimitHeaders(res, context.rateLimit);
+			res.json({ success: true });
+		} catch (error) {
+			addRateLimitHeaders(res, context.rateLimit);
+			const err = error as Error;
+			logger.error("Failed to add repository to project", err);
+			Sentry.captureException(err);
+			res.status(500).json({ error: err.message });
+		}
+	});
+
+	// DELETE /api/projects/:id/repositories/:repoId - Remove repository from project
+	app.delete("/api/projects/:id/repositories/:repoId", async (req: AuthenticatedRequest, res: Response) => {
+		const context = req.authContext!;
+		const { id: projectId, repoId } = req.params;
+
+		if (!projectId || !repoId) {
+			addRateLimitHeaders(res, context.rateLimit);
+			return res.status(400).json({ error: "Project ID and Repository ID are required" });
+		}
+
+		try {
+			await removeRepositoryFromProject(supabase, context.userId, projectId, repoId);
+			addRateLimitHeaders(res, context.rateLimit);
+			res.json({ success: true });
+		} catch (error) {
+			addRateLimitHeaders(res, context.rateLimit);
+			const err = error as Error;
+			logger.error("Failed to remove repository from project", err);
+			Sentry.captureException(err);
+			res.status(500).json({ error: err.message });
+		}
+	});
+
+	// POST /api/auto-reindex - Trigger auto-reindex for user's project repositories
+	app.post("/api/auto-reindex", async (req: AuthenticatedRequest, res: Response) => {
+		const context = req.authContext!;
+
+		try {
+			const result = await triggerAutoReindex(context);
+
+			if (result.rateLimited) {
+				addRateLimitHeaders(res, context.rateLimit);
+				return res.status(429).json({
+					triggered: false,
+					reason: result.reason,
+				});
+			}
+
+			addRateLimitHeaders(res, context.rateLimit);
+
+			// Add X-Auto-Reindex-Triggered header with job count
+			res.set("X-Auto-Reindex-Triggered", String(result.jobCount));
+
+			res.json({
+				triggered: result.triggered,
+				jobCount: result.jobCount,
+				jobIds: result.jobIds,
+				reason: result.reason,
+			});
+		} catch (error) {
+			addRateLimitHeaders(res, context.rateLimit);
+			const err = error as Error;
+			logger.error("Failed to trigger auto-reindex", err);
+			Sentry.captureException(err);
+			res.status(500).json({ error: err.message });
+		}
+	});
+
+	// Sentry error handler middleware (captures errors for remote monitoring)
+	// Must be placed after all routes but before custom error logging
+	app.use(expressErrorHandler());
+
+	// Error logging middleware (structured logs for local debugging)
+	app.use(errorLoggingMiddleware);
 
 	// 404 handler
 	app.use((req: Request, res: Response) => {
