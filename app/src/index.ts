@@ -1,15 +1,10 @@
-// IMPORTANT: Import instrumentation first before all other imports
-// This ensures Sentry can properly trace and capture errors
-import { Sentry } from "./instrument.js";
 import { createExpressApp } from "@api/routes";
 import { getServiceClient } from "@db/client";
 import { startQueue, stopQueue, getQueue } from "@queue/client";
 import { startIndexWorker } from "@queue/workers/index-repo";
 import { QUEUE_NAMES } from "@queue/config";
-import { createLogger } from "@logging/logger";
 
 const PORT = Number(process.env.PORT ?? 3000);
-const logger = createLogger();
 
 async function bootstrap() {
 	// Verify Supabase environment variables
@@ -26,9 +21,13 @@ async function bootstrap() {
 	// Check for GitHub webhook secret (warn if missing, not fatal)
 	const webhookSecret = process.env.GITHUB_WEBHOOK_SECRET;
 	if (!webhookSecret) {
-		logger.warn("GITHUB_WEBHOOK_SECRET not configured - webhook endpoint will reject all requests");
+		process.stderr.write(
+			"[Warning] GITHUB_WEBHOOK_SECRET not configured. Webhook endpoint will reject all requests.\n",
+		);
 	} else if (webhookSecret.length < 16) {
-		logger.warn("GITHUB_WEBHOOK_SECRET is too short (minimum 16 characters recommended)");
+		process.stderr.write(
+			"[Warning] GITHUB_WEBHOOK_SECRET is too short (minimum 16 characters recommended).\n",
+		);
 	}
 
 	// Validate Stripe configuration (optional - warn if incomplete)
@@ -48,14 +47,17 @@ async function bootstrap() {
 		if (!stripeTeamPriceId) missingVars.push("STRIPE_TEAM_PRICE_ID");
 
 		if (missingVars.length > 0) {
-			logger.warn("Partial Stripe configuration detected", {
-				missing_vars: missingVars,
-			});
+			process.stderr.write(
+				`[Warning] Partial Stripe configuration detected. Missing: ${missingVars.join(", ")}. ` +
+					"Subscription endpoints will fail until all Stripe variables are configured.\n",
+			);
 		} else {
-			logger.info("Stripe configuration validated");
+			process.stdout.write("✓ Stripe configuration validated\n");
 		}
 	} else {
-		logger.info("Stripe not configured - subscription features disabled");
+		process.stdout.write(
+			"[Info] Stripe not configured. Subscription features disabled.\n",
+		);
 	}
 
 	// Initialize Supabase client
@@ -69,7 +71,7 @@ async function bootstrap() {
 	if (healthError) {
 		throw new Error(`Supabase connection failed: ${healthError.message}`);
 	}
-	logger.info("Supabase connection successful");
+	process.stdout.write(`[${new Date().toISOString()}] ✓ Supabase connection successful\n`);
 
 	// Start job queue
 	try {
@@ -79,9 +81,11 @@ async function bootstrap() {
 		// pg-boss requires queues to exist before workers can be registered
 		const queue = getQueue();
 		await queue.createQueue(QUEUE_NAMES.INDEX_REPO);
-		logger.info("Job queue started and index-repo queue created");
+		process.stdout.write(`[${new Date().toISOString()}] ✓ Job queue started and index-repo queue created\n`);
 	} catch (error) {
-		logger.error("Failed to start job queue", error instanceof Error ? error : undefined);
+		const errorMessage =
+			error instanceof Error ? error.message : String(error);
+		process.stderr.write(`Failed to start job queue: ${errorMessage}\n`);
 		throw error;
 	}
 
@@ -89,60 +93,57 @@ async function bootstrap() {
 	try {
 		const queue = getQueue();
 		await startIndexWorker(queue);
-		logger.info("Indexing worker registered");
+		process.stdout.write(`[${new Date().toISOString()}] ✓ Indexing worker registered\n`);
 	} catch (error) {
-		logger.error("Failed to start indexing worker", error instanceof Error ? error : undefined);
+		const errorMessage =
+			error instanceof Error ? error.message : String(error);
+		process.stderr.write(`Failed to start indexing worker: ${errorMessage}\n`);
 		throw error;
 	}
 
 	// Create Express app
-	logger.info("Creating Express app");
+	process.stdout.write(`[${new Date().toISOString()}] Creating Express app...\n`);
 	const app = createExpressApp(supabase);
-	logger.info("Express app created");
+	process.stdout.write(`[${new Date().toISOString()}] ✓ Express app created\n`);
 
 	// Start server
 	const server = app.listen(PORT, () => {
-		logger.info("Server started", {
-			port: PORT,
-			supabase_url: supabaseUrl,
-		});
-	});
-
-	// Global error handlers for unhandled errors (after server starts)
-	process.on("unhandledRejection", (reason: unknown, promise: Promise<unknown>) => {
-		logger.error("Unhandled promise rejection", reason instanceof Error ? reason : undefined, {
-			promise: String(promise),
-		});
-		Sentry.captureException(reason);
-	});
-
-	process.on("uncaughtException", (error: Error) => {
-		logger.error("Uncaught exception", error);
-		Sentry.captureException(error);
-		// Exit process after logging - uncaught exceptions leave app in undefined state
-		process.exit(1);
+		process.stdout.write(`KotaDB server listening on http://localhost:${PORT}\n`);
+		process.stdout.write(`Connected to Supabase at ${supabaseUrl}\n`);
 	});
 
 	// Graceful shutdown
 	process.on("SIGTERM", async () => {
-		logger.info("SIGTERM signal received - closing HTTP server");
+		process.stdout.write("SIGTERM signal received: closing HTTP server\n");
 
 		// Stop queue first (drains in-flight jobs)
 		try {
 			await stopQueue();
 		} catch (error) {
-			logger.error("Error stopping queue", error instanceof Error ? error : undefined);
+			process.stderr.write(
+				`Error stopping queue: ${error instanceof Error ? error.message : String(error)}\n`,
+			);
 		}
 
 		// Then close HTTP server
 		server.close(() => {
-			logger.info("HTTP server closed");
+			process.stdout.write("HTTP server closed\n");
 			process.exit(0);
 		});
 	});
 }
 
 bootstrap().catch((error) => {
-	logger.error("Failed to start server", error instanceof Error ? error : undefined);
+	// Extract error details for better diagnostics
+	const errorMessage = error instanceof Error ? error.message : String(error);
+	const errorStack = error instanceof Error ? error.stack : undefined;
+	const errorName = error instanceof Error ? error.name : "Unknown";
+
+	process.stderr.write("Failed to start server:\n");
+	process.stderr.write(`  Error: ${errorName}\n`);
+	process.stderr.write(`  Message: ${errorMessage}\n`);
+	if (errorStack) {
+		process.stderr.write(`  Stack:\n${errorStack}\n`);
+	}
 	process.exit(1);
 });

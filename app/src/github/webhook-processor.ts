@@ -12,11 +12,7 @@
 
 import { getServiceClient } from "@db/client";
 import { createIndexJob } from "@queue/job-tracker";
-import { Sentry } from "../instrument.js";
-import { createLogger } from "@logging/logger.js";
 import type { GitHubPushEvent } from "./types";
-
-const logger = createLogger({ module: "github-webhook-processor" });
 
 /**
  * Process a GitHub push event and queue indexing job if needed.
@@ -44,12 +40,10 @@ export async function processPushEvent(payload: GitHubPushEvent): Promise<void> 
 		// Strip refs/heads/ prefix from ref to get branch name
 		const branchName = ref.replace(/^refs\/heads\//, "");
 
-		logger.info("Processing push event", {
-			repository: fullName,
-			branch: branchName,
-			commit: commitSha.substring(0, 7),
-			installation_id: installationId,
-		});
+		process.stdout.write(`[Webhook Processor] Processing push to ${fullName}@${branchName} (${commitSha.substring(0, 7)})\n`);
+		if (installationId !== undefined) {
+			process.stdout.write(`[Webhook Processor] GitHub App installation_id=${installationId} present in webhook payload\n`);
+		}
 
 		// Look up repository in database
 		const client = getServiceClient();
@@ -60,13 +54,12 @@ export async function processPushEvent(payload: GitHubPushEvent): Promise<void> 
 			.maybeSingle();
 
 		if (repoError) {
-			logger.error("Database error looking up repository", { repository: fullName, error: repoError });
-			Sentry.captureException(repoError);
+			process.stderr.write(`[Webhook Processor] Database error looking up repository ${fullName}: ${JSON.stringify(repoError)}\n`);
 			return;
 		}
 
 		if (!repo) {
-			logger.info("Ignoring push to untracked repository", { repository: fullName });
+			process.stdout.write(`[Webhook Processor] Ignoring push to untracked repository: ${fullName}\n`);
 			return;
 		}
 
@@ -78,11 +71,10 @@ export async function processPushEvent(payload: GitHubPushEvent): Promise<void> 
 				.eq("id", repo.id);
 
 			if (updateError) {
-				logger.warn("Failed to store installation_id", { repository: fullName, installation_id: installationId, error: updateError });
-				Sentry.captureException(updateError);
+				process.stderr.write(`[Webhook Processor] Failed to store installation_id for ${fullName}: ${JSON.stringify(updateError)}\n`);
 				// Continue processing - installation_id storage is not critical for public repos
 			} else {
-				logger.info("Stored installation_id", { repository: fullName, installation_id: installationId });
+				process.stdout.write(`[Webhook Processor] Stored installation_id=${installationId} for repository ${fullName}\n`);
 			}
 		}
 
@@ -90,11 +82,7 @@ export async function processPushEvent(payload: GitHubPushEvent): Promise<void> 
 		// Use repository's stored default_branch if available, otherwise fall back to payload
 		const effectiveDefaultBranch = repo.default_branch || defaultBranch;
 		if (branchName !== effectiveDefaultBranch) {
-			logger.info("Ignoring push to non-default branch", {
-				repository: fullName,
-				branch: branchName,
-				default_branch: effectiveDefaultBranch
-			});
+			process.stdout.write(`[Webhook Processor] Ignoring push to non-default branch: ${fullName}@${branchName} (default: ${effectiveDefaultBranch})\n`);
 			return;
 		}
 
@@ -108,35 +96,25 @@ export async function processPushEvent(payload: GitHubPushEvent): Promise<void> 
 			.maybeSingle();
 
 		if (jobError) {
-			logger.error("Database error checking for duplicate job", { repository: fullName, commit: commitSha.substring(0, 7), error: jobError });
-			Sentry.captureException(jobError);
+			process.stderr.write(`[Webhook Processor] Database error checking for duplicate job: ${JSON.stringify(jobError)}\n`);
 			return;
 		}
 
 		if (existingJob) {
-			logger.info("Duplicate job detected", {
-				repository: fullName,
-				commit: commitSha.substring(0, 7),
-				job_id: existingJob.id
-			});
+			process.stdout.write(`[Webhook Processor] Duplicate job detected for ${fullName}@${commitSha.substring(0, 7)}: job ${existingJob.id} already pending\n`);
 			return;
 		}
 
 		// Resolve user context for RLS enforcement
 		const userId = await resolveUserIdForRepository(repo);
 		if (!userId) {
-			logger.error("Cannot queue job: no user context found", { repository: fullName });
+			process.stderr.write(`[Webhook Processor] Cannot queue job for ${fullName}: no user context found (orphaned repository)\n`);
 			return;
 		}
 
 		// Create index job via job-tracker
 		const job = await createIndexJob(repo.id, ref, commitSha, userId);
-		logger.info("Queued indexing job", {
-			job_id: job.id,
-			repository: fullName,
-			branch: branchName,
-			commit: commitSha.substring(0, 7)
-		});
+		process.stdout.write(`[Webhook Processor] Queued job ${job.id} for ${fullName}@${branchName} (${commitSha.substring(0, 7)})\n`);
 
 		// Update repository last_push_at timestamp
 		const { error: updateError } = await client
@@ -145,19 +123,15 @@ export async function processPushEvent(payload: GitHubPushEvent): Promise<void> 
 			.eq("id", repo.id);
 
 		if (updateError) {
-			logger.warn("Failed to update last_push_at", { repository: fullName, error: updateError });
-			Sentry.captureException(updateError);
+			process.stderr.write(`[Webhook Processor] Failed to update last_push_at for ${fullName}: ${JSON.stringify(updateError)}\n`);
 			// Don't return - job was successfully queued, this is just metadata
 		}
 
-		logger.info("Successfully processed push event", { repository: fullName });
+		process.stdout.write(`[Webhook Processor] Successfully processed push event for ${fullName}\n`);
 	} catch (error) {
 		// Catch all errors to prevent webhook failures
 		// GitHub expects 200 OK for all valid signatures, even if we fail to process
-		logger.error("Unexpected error processing push event", error instanceof Error ? error : undefined, {
-			operation: "processPushEvent",
-		});
-		Sentry.captureException(error);
+		process.stderr.write(`[Webhook Processor] Unexpected error processing push event: ${JSON.stringify(error)}\n`);
 	}
 }
 
@@ -189,8 +163,7 @@ async function resolveUserIdForRepository(
 			.maybeSingle();
 
 		if (error) {
-			logger.error("Error querying user_organizations", { org_id: repo.org_id, error });
-			Sentry.captureException(error);
+			process.stderr.write(`[Webhook Processor] Error querying user_organizations for org ${repo.org_id}: ${JSON.stringify(error)}\n`);
 			return null;
 		}
 
@@ -200,6 +173,6 @@ async function resolveUserIdForRepository(
 	}
 
 	// No user context found (orphaned repository)
-	logger.error("Repository has no user or org association", { repository: repo.full_name });
+	process.stderr.write(`[Webhook Processor] Repository ${repo.full_name} has no user or org association\n`);
 	return null;
 }

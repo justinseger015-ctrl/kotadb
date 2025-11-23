@@ -10,19 +10,14 @@ import { randomBytes } from "node:crypto";
 import type { Tier } from "@shared/types/auth";
 import { getServiceClient } from "@db/client";
 import bcrypt from "bcryptjs";
-import { Sentry } from "../instrument.js";
-import { createLogger } from "@logging/logger.js";
-
-const logger = createLogger({ module: "auth-keys" });
 
 /**
  * Rate limit defaults for each tier (requests per hour).
- * Updated in #423 to support realistic development workflows.
  */
 export const TIER_RATE_LIMITS = {
-	free: 1000,
-	solo: 5000,
-	team: 25000,
+	free: 100,
+	solo: 1000,
+	team: 10000,
 } as const;
 
 /**
@@ -196,29 +191,15 @@ export async function generateApiKey(
 				// Check if this is a unique constraint violation on key_id
 				// Supabase error code for unique violation: "23505"
 				if (error.code === "23505" && error.message.includes("key_id")) {
-					logger.warn("key_id collision detected during API key generation", {
-						keyId,
-						attempt: attempt + 1,
-						maxRetries: MAX_COLLISION_RETRIES,
-						userId,
-						tier,
-					});
+					process.stderr.write(
+						`[Auth] key_id collision detected (attempt ${attempt + 1}/${MAX_COLLISION_RETRIES}): ${keyId}`,
+					);
 					lastError = new Error(`key_id collision: ${error.message}`);
 					continue; // Retry with new key_id
 				}
 
 				// Other database errors (not collision-related)
-				const dbError = new Error(`Failed to create API key: ${error.message}`);
-				Sentry.captureException(dbError, {
-					extra: {
-						keyId,
-						userId,
-						tier,
-						errorCode: error.code,
-						errorMessage: error.message,
-					},
-				});
-				throw dbError;
+				throw new Error(`Failed to create API key: ${error.message}`);
 			}
 
 			// Success!
@@ -232,13 +213,6 @@ export async function generateApiKey(
 		} catch (err) {
 			// Re-throw non-collision errors immediately
 			if (err instanceof Error && !err.message.includes("key_id collision")) {
-				Sentry.captureException(err, {
-					extra: {
-						userId,
-						tier,
-						attempt: attempt + 1,
-					},
-				});
 				throw err;
 			}
 			lastError = err instanceof Error ? err : new Error(String(err));
@@ -246,18 +220,9 @@ export async function generateApiKey(
 	}
 
 	// All retries exhausted
-	const exhaustedError = new Error(
+	throw new Error(
 		`Failed to generate unique API key after ${MAX_COLLISION_RETRIES} attempts. Last error: ${lastError?.message}`,
 	);
-	Sentry.captureException(exhaustedError, {
-		extra: {
-			userId,
-			tier,
-			collisionCount: MAX_COLLISION_RETRIES,
-			lastErrorMessage: lastError?.message,
-		},
-	});
-	throw exhaustedError;
 }
 
 /**

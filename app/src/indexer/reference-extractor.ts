@@ -25,10 +25,6 @@
  */
 
 import type { TSESTree } from "@typescript-eslint/types";
-import { Sentry } from "../instrument.js";
-import { createLogger } from "@logging/logger.js";
-
-const logger = createLogger({ module: "indexer-reference-extractor" });
 
 /**
  * Reference metadata extracted from AST nodes.

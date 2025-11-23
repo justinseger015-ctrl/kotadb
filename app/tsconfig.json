@@ -23,8 +23,7 @@
 			"@validation/*": ["src/validation/*"],
 			"@queue/*": ["src/queue/*"],
 			"@github/*": ["src/github/*"],
-			"@app-types/*": ["src/types/*"],
-			"@logging/*": ["src/logging/*"]
+			"@app-types/*": ["src/types/*"]
 		},
 		"types": ["bun-types", "node"]
 	},

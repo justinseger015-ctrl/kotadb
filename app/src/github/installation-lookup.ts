@@ -7,13 +7,8 @@
  */
 
 import { App } from "@octokit/app";
-import { Sentry } from "../instrument.js";
-import { createLogger } from "@logging/logger.js";
 import type { GitHubAppConfig } from "./types";
 import { GitHubAppError } from "./types";
-import { getOctokitForInstallation } from "./client";
-
-const logger = createLogger({ module: "github-installation-lookup" });
 
 // In-memory cache for failed lookups to avoid repeated API calls
 // Map<"owner/repo", timestamp>
@@ -31,29 +26,22 @@ function getGitHubAppConfig(): GitHubAppConfig {
 	const privateKey = process.env.GITHUB_APP_PRIVATE_KEY;
 
 	// Log environment variable presence for production debugging
-	logger.info("GitHub App config check", {
-		github_app_id: appId ? "present" : "missing",
-		github_app_private_key: privateKey ? "present" : "missing",
-	});
+	process.stdout.write(
+		`[Installation Lookup] GitHub App config check: GITHUB_APP_ID=${appId ? "present" : "missing"}, GITHUB_APP_PRIVATE_KEY=${privateKey ? "present" : "missing"}\n`,
+	);
 
 	if (!appId) {
-		const error = new GitHubAppError(
+		throw new GitHubAppError(
 			"Missing GITHUB_APP_ID environment variable. Set this to your GitHub App ID from app settings.",
 			"MISSING_APP_ID",
 		);
-		logger.error("Missing GITHUB_APP_ID environment variable", error);
-		Sentry.captureException(error);
-		throw error;
 	}
 
 	if (!privateKey) {
-		const error = new GitHubAppError(
+		throw new GitHubAppError(
 			"Missing GITHUB_APP_PRIVATE_KEY environment variable. Set this to your GitHub App's RSA private key in PEM format.",
 			"MISSING_PRIVATE_KEY",
 		);
-		logger.error("Missing GITHUB_APP_PRIVATE_KEY environment variable", error);
-		Sentry.captureException(error);
-		throw error;
 	}
 
 	return { appId, privateKey };
@@ -72,14 +60,11 @@ function createAppClient(): App {
 			privateKey: config.privateKey,
 		});
 	} catch (error) {
-		const appError = new GitHubAppError(
+		throw new GitHubAppError(
 			"Failed to initialize GitHub App client. Verify GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY are valid.",
 			"INVALID_CREDENTIALS",
 			error,
 		);
-		logger.error("Failed to initialize GitHub App client", appError);
-		Sentry.captureException(appError);
-		throw appError;
 	}
 }
 
@@ -129,87 +114,66 @@ export async function getInstallationForRepository(
 		const ageMinutes = cachedAt
 			? Math.floor((Date.now() - cachedAt) / 60000)
 			: 0;
-		logger.info("Skipping cached failed lookup", {
-			repository: fullName,
-			cached_minutes_ago: ageMinutes,
-			ttl_minutes: 60,
-		});
+		process.stdout.write(
+			`[Installation Lookup] Skipping cached failed lookup for ${fullName} (cached ${ageMinutes}m ago, TTL=60m)\n`,
+		);
 		return null;
 	}
 
 	try {
 		const app = createAppClient();
 
-		logger.info("Querying GitHub App installations", {
-			repository: fullName,
-		});
+		process.stdout.write(
+			`[Installation Lookup] Querying installations for ${fullName}\n`,
+		);
 
 		// List all installations for this GitHub App
 		const { data: installations } = await app.octokit.request(
 			"GET /app/installations",
 		);
 
-		logger.info("Found GitHub App installations", {
-			repository: fullName,
-			installation_count: installations.length,
-		});
+		process.stdout.write(
+			`[Installation Lookup] Found ${installations.length} installation(s)\n`,
+		);
 
 		// Check each installation for repository access
 		for (const installation of installations) {
 			try {
-				// Generate installation token and create authenticated Octokit client
-				const installationOctokit =
-					await getOctokitForInstallation(installation.id);
-
 				// Get repositories accessible by this installation
-				const { data } = await installationOctokit.request(
-					"GET /installation/repositories",
+				const { data: reposResponse } = await app.octokit.request(
+					"GET /user/installations/{installation_id}/repositories",
+					{
+						installation_id: installation.id,
+					},
 				);
 
 				// Check if our repository is in the list
-				const foundRepo = data.repositories.find(
+				const foundRepo = reposResponse.repositories.find(
 					(r) => r.full_name.toLowerCase() === fullName.toLowerCase(),
 				);
 
 				if (foundRepo) {
-					logger.info("Found GitHub App installation for repository", {
-						repository: fullName,
-						installation_id: installation.id,
-					});
+					process.stdout.write(
+						`[Installation Lookup] Found installation ${installation.id} for ${fullName}\n`,
+					);
 					return installation.id;
 				}
 			} catch (installationError: unknown) {
-				// Handle token generation or API errors
+				// Log and continue to next installation
 				const apiError = installationError as {
 					response?: { status: number };
-					message?: string;
 				};
-
-				// Log specific error context for debugging
-				if (installationError instanceof GitHubAppError) {
-					logger.warn("Token generation failed for installation", {
-						installation_id: installation.id,
-						error_code: installationError.code,
-					});
-					Sentry.captureException(installationError);
-				} else {
-					logger.warn("Error checking installation", {
-						installation_id: installation.id,
-						status: apiError.response?.status,
-						message: apiError.message,
-					});
-					if (installationError instanceof Error) {
-						Sentry.captureException(installationError);
-					}
-				}
+				process.stderr.write(
+					`[Installation Lookup] Error checking installation ${installation.id}: ${apiError.response?.status ?? "unknown"}\n`,
+				);
 				continue;
 			}
 		}
 
 		// No installation found for this repository
-		logger.info("No GitHub App installation found for repository", {
-			repository: fullName,
-		});
+		process.stdout.write(
+			`[Installation Lookup] No installation found for ${fullName}\n`,
+		);
 
 		// Cache this failed lookup
 		failedLookupCache.set(fullName, Date.now());
@@ -221,37 +185,21 @@ export async function getInstallationForRepository(
 
 		// Log different error types
 		if (apiError.response?.status === 401) {
-			logger.error(
-				"GitHub App authentication failed",
-				error instanceof Error ? error : new Error(String(error)),
-				{
-					repository: fullName,
-					status: 401,
-				},
+			process.stderr.write(
+				`[Installation Lookup] GitHub App authentication failed for ${fullName}. Verify GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY.\n`,
 			);
-			Sentry.captureException(error);
 		} else if (apiError.response?.status === 403) {
-			logger.warn("GitHub API rate limit exceeded", {
-				repository: fullName,
-				status: 403,
-			});
-			Sentry.captureException(error);
-		} else if (apiError.response?.status === 404) {
-			logger.warn("GitHub App or repository not found", {
-				repository: fullName,
-				status: 404,
-			});
-			Sentry.captureException(error);
-		} else {
-			logger.error(
-				"GitHub API error during installation lookup",
-				error instanceof Error ? error : new Error(String(error)),
-				{
-					repository: fullName,
-					status: apiError.response?.status,
-				},
+			process.stderr.write(
+				`[Installation Lookup] GitHub API rate limit exceeded for ${fullName}. Will retry later.\n`,
 			);
-			Sentry.captureException(error);
+		} else if (apiError.response?.status === 404) {
+			process.stderr.write(
+				`[Installation Lookup] GitHub App or repository ${fullName} not found.\n`,
+			);
+		} else {
+			process.stderr.write(
+				`[Installation Lookup] API error for ${fullName}: ${error instanceof Error ? error.message : String(error)}\n`,
+			);
 		}
 
 		// Cache this failed lookup
@@ -269,12 +217,14 @@ export async function getInstallationForRepository(
 export function clearFailedLookupCache(fullName?: string): void {
 	if (fullName) {
 		failedLookupCache.delete(fullName);
-		logger.info("Cleared failed lookup cache for repository", {
-			repository: fullName,
-		});
+		process.stdout.write(
+			`[Installation Lookup] Cleared failed lookup cache for ${fullName}\n`,
+		);
 	} else {
 		failedLookupCache.clear();
-		logger.info("Cleared all failed lookup cache");
+		process.stdout.write(
+			"[Installation Lookup] Cleared all failed lookup cache\n",
+		);
 	}
 }
 

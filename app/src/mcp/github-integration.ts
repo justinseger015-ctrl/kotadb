@@ -8,11 +8,7 @@
  * - Check branch existence and modification timestamps
  */
 
-import { Sentry } from "../instrument.js";
-import { createLogger } from "@logging/logger.js";
 import type { ConflictInfo } from "@shared/types";
-
-const logger = createLogger({ module: "mcp-github-integration" });
 
 interface PullRequest {
 	number: number;
@@ -77,7 +73,9 @@ export class GitHubClient {
 	 */
 	async queryOpenPRs(owner: string, repo: string): Promise<PullRequest[]> {
 		if (!this.isAvailable()) {
-			logger.info("No GitHub token available, skipping PR query", { owner, repo });
+			process.stdout.write(
+				"[GitHub Integration] No GitHub token available, skipping PR query\n",
+			);
 			return [];
 		}
 
@@ -85,39 +83,22 @@ export class GitHubClient {
 		return await this.getCached(cacheKey, async () => {
 			const url = `${this.baseUrl}/repos/${owner}/${repo}/pulls?state=open`;
 
-			try {
-				const response = await fetch(url, {
-					headers: {
-						Authorization: `Bearer ${this.token}`,
-						Accept: "application/vnd.github+json",
-						"X-GitHub-Api-Version": "2022-11-28",
-					},
-				});
+			const response = await fetch(url, {
+				headers: {
+					Authorization: `Bearer ${this.token}`,
+					Accept: "application/vnd.github+json",
+					"X-GitHub-Api-Version": "2022-11-28",
+				},
+			});
 
-				if (!response.ok) {
-					const error = new Error(`Failed to query PRs: ${response.status} ${response.statusText}`);
-					logger.error("GitHub API error when querying PRs", error, {
-						owner,
-						repo,
-						status: response.status,
-					});
-					Sentry.captureException(error, {
-						tags: { owner, repo, status: response.status },
-					});
-					return [];
-				}
-
-				return (await response.json()) as PullRequest[];
-			} catch (error) {
-				logger.error("Failed to query PRs", error instanceof Error ? error : new Error(String(error)), {
-					owner,
-					repo,
-				});
-				Sentry.captureException(error, {
-					tags: { owner, repo },
-				});
+			if (!response.ok) {
+				process.stderr.write(
+					`[GitHub Integration] Failed to query PRs: ${response.status} ${response.statusText}\n`,
+				);
 				return [];
 			}
+
+			return (await response.json()) as PullRequest[];
 		});
 	}
 
@@ -142,45 +123,26 @@ export class GitHubClient {
 		return await this.getCached(cacheKey, async () => {
 			const url = `${this.baseUrl}/repos/${owner}/${repo}/pulls/${prNumber}/files`;
 
-			try {
-				const response = await fetch(url, {
-					headers: {
-						Authorization: `Bearer ${this.token}`,
-						Accept: "application/vnd.github+json",
-						"X-GitHub-Api-Version": "2022-11-28",
-					},
-				});
+			const response = await fetch(url, {
+				headers: {
+					Authorization: `Bearer ${this.token}`,
+					Accept: "application/vnd.github+json",
+					"X-GitHub-Api-Version": "2022-11-28",
+				},
+			});
 
-				if (!response.ok) {
-					const error = new Error(`Failed to query PR files: ${response.status} ${response.statusText}`);
-					logger.error("GitHub API error when querying PR files", error, {
-						owner,
-						repo,
-						pr_number: prNumber,
-						status: response.status,
-					});
-					Sentry.captureException(error, {
-						tags: { owner, repo, pr_number: prNumber, status: response.status },
-					});
-					return [];
-				}
-
-				const files = (await response.json()) as Array<{
-					filename: string;
-					status: string;
-				}>;
-				return files.map((f) => f.filename);
-			} catch (error) {
-				logger.error("Failed to query PR files", error instanceof Error ? error : new Error(String(error)), {
-					owner,
-					repo,
-					pr_number: prNumber,
-				});
-				Sentry.captureException(error, {
-					tags: { owner, repo, pr_number: prNumber },
-				});
+			if (!response.ok) {
+				process.stderr.write(
+					`[GitHub Integration] Failed to query PR files: ${response.status} ${response.statusText}\n`,
+				);
 				return [];
 			}
+
+			const files = (await response.json()) as Array<{
+				filename: string;
+				status: string;
+			}>;
+			return files.map((f) => f.filename);
 		});
 	}
 
@@ -198,7 +160,9 @@ export class GitHubClient {
 		filePaths: string[],
 	): Promise<ConflictInfo[]> {
 		if (!this.isAvailable()) {
-			logger.info("No GitHub token available, skipping conflict detection", { owner, repo });
+			process.stdout.write(
+				"[GitHub Integration] No GitHub token available, skipping conflict detection\n",
+			);
 			return [];
 		}
 
@@ -226,21 +190,11 @@ export class GitHubClient {
 				}
 			}
 
-			logger.debug("File conflict detection completed", {
-				owner,
-				repo,
-				conflicts_found: conflicts.length,
-			});
-
 			return conflicts;
 		} catch (error) {
-			logger.error("Error detecting conflicts", error instanceof Error ? error : new Error(String(error)), {
-				owner,
-				repo,
-			});
-			Sentry.captureException(error, {
-				tags: { owner, repo },
-			});
+			process.stderr.write(
+				`[GitHub Integration] Error detecting conflicts: ${error instanceof Error ? error.message : String(error)}\n`,
+			);
 			return [];
 		}
 	}

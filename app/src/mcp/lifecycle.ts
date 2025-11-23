@@ -2,11 +2,6 @@
  * MCP lifecycle handlers (initialize, capability negotiation)
  */
 
-import { Sentry } from "../instrument.js";
-import { createLogger } from "@logging/logger.js";
-
-const logger = createLogger({ module: "mcp-lifecycle" });
-
 export interface ClientInfo {
 	name: string;
 	version: string;
@@ -43,28 +38,16 @@ export interface InitializeResult {
  * Handle initialize request from MCP client
  */
 export function handleInitialize(_params: InitializeRequest): InitializeResult {
-	try {
-		logger.info("MCP server initialization", {
-			client_name: _params.clientInfo.name,
-			client_version: _params.clientInfo.version,
-			protocol_version: _params.protocolVersion,
-		});
-
-		return {
-			protocolVersion: "2025-06-18",
-			capabilities: {
-				tools: {
-					listChanged: false,
-				},
+	return {
+		protocolVersion: "2025-06-18",
+		capabilities: {
+			tools: {
+				listChanged: false,
 			},
-			serverInfo: {
-				name: "kotadb",
-				version: "0.1.0",
-			},
-		};
-	} catch (error) {
-		logger.error("MCP server initialization failed", error instanceof Error ? error : new Error(String(error)));
-		Sentry.captureException(error);
-		throw error;
-	}
+		},
+		serverInfo: {
+			name: "kotadb",
+			version: "0.1.0",
+		},
+	};
 }
