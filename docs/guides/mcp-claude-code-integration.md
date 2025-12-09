@@ -1,5 +1,7 @@
 # MCP Claude Code Integration Guide
 
+> **BREAKING CHANGE (v0.1.1)**: The MCP endpoint now requires the Accept header to include both `application/json` AND `text/event-stream`. See [Migration Guide](../migration/v0.1.0-to-v0.1.1.md) if you're upgrading from v0.1.0.
+
 This guide explains how to integrate KotaDB with Claude Code using the Model Context Protocol (MCP).
 
 ## Overview
@@ -45,21 +47,64 @@ kotadb: ✓ Connected (http://localhost:3000/mcp)
 
 ## Configuration File (.mcp.json)
 
-Claude Code stores MCP server configurations in `~/.claude/mcp.json`. Here's what the KotaDB entry looks like:
+Claude Code stores MCP server configurations in `.mcp.json` in your project root. Here's what the KotaDB entry looks like:
 
 ```json
 {
-  "servers": {
-    "kotadb": {
-      "url": "http://localhost:3000/mcp",
-      "transport": "http",
+  "mcpServers": {
+    "kotadb-staging": {
+      "type": "http",
+      "url": "https://kotadb-staging.fly.dev/mcp",
       "headers": {
-        "Authorization": "Bearer kota_free_test1234567890ab_0123456789abcdef0123456789abcdef"
+        "Authorization": "Bearer kota_solo_YOUR_API_KEY_HERE",
+        "Accept": "application/json, text/event-stream",
+        "MCP-Protocol-Version": "2025-06-18"
+      }
+    },
+    "kotadb-production": {
+      "type": "http",
+      "url": "https://kotadb.fly.dev/mcp",
+      "headers": {
+        "Authorization": "Bearer ${KOTADB_PRODUCTION_API_KEY}",
+        "Accept": "application/json, text/event-stream",
+        "MCP-Protocol-Version": "2025-06-18"
       }
     }
   }
 }
 ```
+
+### Required Headers
+
+**CRITICAL**: The following headers are required for MCP connections:
+
+1. **Accept**: Must include both `application/json` and `text/event-stream`
+   - Format: `"Accept": "application/json, text/event-stream"`
+   - Without this, requests will fail with HTTP 406 "Not Acceptable"
+
+2. **MCP-Protocol-Version**: Must match the server's protocol version
+   - Current version: `"2025-06-18"`
+   - Required for protocol compatibility
+
+3. **Authorization**: Your KotaDB API key
+   - Format: `"Bearer kota_{tier}_{random}_{hash}"`
+   - Can use environment variables: `"Bearer ${KOTADB_API_KEY}"`
+
+### Environment Variables
+
+You can use environment variables in headers with the `${VAR}` syntax:
+
+```json
+{
+  "headers": {
+    "Authorization": "Bearer ${KOTADB_API_KEY}",
+    "Accept": "application/json, text/event-stream",
+    "MCP-Protocol-Version": "2025-06-18"
+  }
+}
+```
+
+Optionally specify defaults: `${VAR:-default_value}`
 
 ## Available Tools
 
@@ -173,6 +218,24 @@ Expected response:
 1. Verify server is running: `curl http://localhost:3000/health`
 2. Check API key is valid
 3. Verify MCP endpoint is accessible: `curl http://localhost:3000/mcp`
+
+### 406 Not Acceptable
+
+**Error**: `Not Acceptable: Client must accept both application/json and text/event-stream`
+
+**Solution**: Ensure your `.mcp.json` includes the required `Accept` header:
+
+```json
+{
+  "headers": {
+    "Authorization": "Bearer YOUR_API_KEY",
+    "Accept": "application/json, text/event-stream",
+    "MCP-Protocol-Version": "2025-06-18"
+  }
+}
+```
+
+This is a common issue when upgrading or first configuring Claude Code integration. The MCP SDK requires both content types in the Accept header even when using JSON-only mode.
 
 ### 401 Unauthorized
 
@@ -296,6 +359,6 @@ Errors follow JSON-RPC 2.0 error codes:
 
 ---
 
-**Last Verified**: 2025-10-18
-**KotaDB Version**: 0.1.0
+**Last Verified**: 2025-12-05
+**KotaDB Version**: 0.1.1
 **MCP Protocol Version**: 2025-06-18

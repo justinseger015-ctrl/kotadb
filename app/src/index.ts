@@ -1,8 +1,11 @@
 import { createExpressApp } from "@api/routes";
 import { getServiceClient } from "@db/client";
-import { startQueue, stopQueue, getQueue } from "@queue/client";
-import { startIndexWorker } from "@queue/workers/index-repo";
+import { createLogger } from "@logging/logger.js";
+import { getQueue, startQueue, stopQueue } from "@queue/client";
 import { QUEUE_NAMES } from "@queue/config";
+import { startIndexWorker } from "@queue/workers/index-repo";
+
+const logger = createLogger({ module: "bootstrap" });
 
 const PORT = Number(process.env.PORT ?? 3000);
 
@@ -31,43 +34,44 @@ async function bootstrap() {
 	}
 
 	// Validate Stripe configuration (optional - warn if incomplete)
-	const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
-	const stripeWebhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
-	const stripeSoloPriceId = process.env.STRIPE_SOLO_PRICE_ID;
-	const stripeTeamPriceId = process.env.STRIPE_TEAM_PRICE_ID;
+	const billingEnabled = process.env.ENABLE_BILLING === "true";
+	logger.info("Billing feature flag", { enabled: billingEnabled });
 
-	const stripeConfigPresent =
-		stripeSecretKey || stripeWebhookSecret || stripeSoloPriceId || stripeTeamPriceId;
+	if (billingEnabled) {
+		const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
+		const stripeWebhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+		const stripeSoloPriceId = process.env.STRIPE_SOLO_PRICE_ID;
+		const stripeTeamPriceId = process.env.STRIPE_TEAM_PRICE_ID;
 
-	if (stripeConfigPresent) {
-		const missingVars: string[] = [];
-		if (!stripeSecretKey) missingVars.push("STRIPE_SECRET_KEY");
-		if (!stripeWebhookSecret) missingVars.push("STRIPE_WEBHOOK_SECRET");
-		if (!stripeSoloPriceId) missingVars.push("STRIPE_SOLO_PRICE_ID");
-		if (!stripeTeamPriceId) missingVars.push("STRIPE_TEAM_PRICE_ID");
+		const stripeConfigPresent =
+			stripeSecretKey || stripeWebhookSecret || stripeSoloPriceId || stripeTeamPriceId;
 
-		if (missingVars.length > 0) {
-			process.stderr.write(
-				`[Warning] Partial Stripe configuration detected. Missing: ${missingVars.join(", ")}. ` +
-					"Subscription endpoints will fail until all Stripe variables are configured.\n",
-			);
+		if (stripeConfigPresent) {
+			const missingVars: string[] = [];
+			if (!stripeSecretKey) missingVars.push("STRIPE_SECRET_KEY");
+			if (!stripeWebhookSecret) missingVars.push("STRIPE_WEBHOOK_SECRET");
+			if (!stripeSoloPriceId) missingVars.push("STRIPE_SOLO_PRICE_ID");
+			if (!stripeTeamPriceId) missingVars.push("STRIPE_TEAM_PRICE_ID");
+
+			if (missingVars.length > 0) {
+				logger.warn("Partial Stripe configuration detected", {
+					missing_vars: missingVars,
+				});
+			} else {
+				logger.info("Stripe configuration validated");
+			}
 		} else {
-			process.stdout.write("✓ Stripe configuration validated\n");
+			logger.info("Stripe not configured - subscription features disabled");
 		}
 	} else {
-		process.stdout.write(
-			"[Info] Stripe not configured. Subscription features disabled.\n",
-		);
+		logger.info("Billing disabled by feature flag - subscription features unavailable");
 	}
 
 	// Initialize Supabase client
 	const supabase = getServiceClient();
 
 	// Test database connection
-	const { error: healthError } = await supabase
-		.from("migrations")
-		.select("id")
-		.limit(1);
+	const { error: healthError } = await supabase.from("migrations").select("id").limit(1);
 	if (healthError) {
 		throw new Error(`Supabase connection failed: ${healthError.message}`);
 	}
@@ -81,10 +85,11 @@ async function bootstrap() {
 		// pg-boss requires queues to exist before workers can be registered
 		const queue = getQueue();
 		await queue.createQueue(QUEUE_NAMES.INDEX_REPO);
-		process.stdout.write(`[${new Date().toISOString()}] ✓ Job queue started and index-repo queue created\n`);
+		process.stdout.write(
+			`[${new Date().toISOString()}] ✓ Job queue started and index-repo queue created\n`,
+		);
 	} catch (error) {
-		const errorMessage =
-			error instanceof Error ? error.message : String(error);
+		const errorMessage = error instanceof Error ? error.message : String(error);
 		process.stderr.write(`Failed to start job queue: ${errorMessage}\n`);
 		throw error;
 	}
@@ -95,8 +100,7 @@ async function bootstrap() {
 		await startIndexWorker(queue);
 		process.stdout.write(`[${new Date().toISOString()}] ✓ Indexing worker registered\n`);
 	} catch (error) {
-		const errorMessage =
-			error instanceof Error ? error.message : String(error);
+		const errorMessage = error instanceof Error ? error.message : String(error);
 		process.stderr.write(`Failed to start indexing worker: ${errorMessage}\n`);
 		throw error;
 	}

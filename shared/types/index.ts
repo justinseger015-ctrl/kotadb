@@ -63,3 +63,11 @@ export type {
 	ValidationResult,
 	ValidationIssue,
 } from "./mcp-tools";
+
+// Project management types
+export type {
+	ProjectListItem,
+	ProjectWithRepos,
+	CreateProjectRequest,
+	UpdateProjectRequest,
+} from "./projects";

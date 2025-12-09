@@ -3,27 +3,38 @@
  */
 
 import {
+	addRepositoryToProject,
+	createProject,
+	deleteProject,
+	getProject,
+	listProjects,
+	removeRepositoryFromProject,
+	updateProject,
+} from "@api/projects";
+import {
+	type DependencyResult,
 	ensureRepository,
+	getIndexJobStatus,
 	listRecentFiles,
+	queryDependencies,
+	queryDependents,
 	recordIndexRun,
+	resolveFilePath,
 	runIndexingWorkflow,
 	searchFiles,
 	updateIndexRunStatus,
-	resolveFilePath,
-	queryDependents,
-	queryDependencies,
-	type DependencyResult,
 } from "@api/queries";
+import { setUserContext } from "@db/client.js";
 import { buildSnippet } from "@indexer/extractors";
-import type {
-	IndexRequest,
-	ChangeImpactRequest,
-	ImplementationSpec,
-} from "@shared/types";
+import { createLogger } from "@logging/logger.js";
+import type { ChangeImpactRequest, ImplementationSpec, IndexRequest } from "@shared/types";
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { invalidParams } from "./jsonrpc";
+import { Sentry } from "../instrument.js";
 import { analyzeChangeImpact } from "./impact-analysis";
+import { invalidParams } from "./jsonrpc";
 import { validateImplementationSpec } from "./spec-validation";
+
+const logger = createLogger({ module: "mcp-tools" });
 
 /**
  * MCP Tool Definition
@@ -52,14 +63,17 @@ export const SEARCH_CODE_TOOL: ToolDefinition = {
 				type: "string",
 				description: "The search term to find in code files",
 			},
+			project: {
+				type: "string",
+				description: "Optional: Filter results to a specific project (by name or UUID)",
+			},
 			repository: {
 				type: "string",
 				description: "Optional: Filter results to a specific repository ID",
 			},
 			limit: {
 				type: "number",
-				description:
-					"Optional: Maximum number of results (default: 20, max: 100)",
+				description: "Optional: Maximum number of results (default: 20, max: 100)",
 			},
 		},
 		required: ["term"],
@@ -78,18 +92,11 @@ export const INDEX_REPOSITORY_TOOL: ToolDefinition = {
 		properties: {
 			repository: {
 				type: "string",
-				description:
-					"Repository identifier (e.g., 'owner/repo' or full git URL)",
+				description: "Repository identifier (e.g., 'owner/repo' or full git URL)",
 			},
 			ref: {
 				type: "string",
-				description:
-					"Optional: Git ref/branch to checkout (default: main/master)",
-			},
-			localPath: {
-				type: "string",
-				description:
-					"Optional: Use a local directory instead of cloning from git",
+				description: "Optional: Git ref/branch to checkout (default: main/master)",
 			},
 		},
 		required: ["repository"],
@@ -108,8 +115,7 @@ export const LIST_RECENT_FILES_TOOL: ToolDefinition = {
 		properties: {
 			limit: {
 				type: "number",
-				description:
-					"Optional: Maximum number of files to return (default: 10)",
+				description: "Optional: Maximum number of files to return (default: 10)",
 			},
 		},
 	},
@@ -127,8 +133,7 @@ export const SEARCH_DEPENDENCIES_TOOL: ToolDefinition = {
 		properties: {
 			file_path: {
 				type: "string",
-				description:
-					"Relative file path within the repository (e.g., 'src/auth/context.ts')",
+				description: "Relative file path within the repository (e.g., 'src/auth/context.ts')",
 			},
 			direction: {
 				type: "string",
@@ -148,8 +153,7 @@ export const SEARCH_DEPENDENCIES_TOOL: ToolDefinition = {
 			},
 			repository: {
 				type: "string",
-				description:
-					"Repository ID to search within. Required for multi-repository workspaces.",
+				description: "Repository ID to search within. Required for multi-repository workspaces.",
 			},
 		},
 		required: ["file_path"],
@@ -286,6 +290,188 @@ export const VALIDATE_IMPLEMENTATION_SPEC_TOOL: ToolDefinition = {
 };
 
 /**
+ * Tool: create_project
+ */
+export const CREATE_PROJECT_TOOL: ToolDefinition = {
+	name: "create_project",
+	description: "Create a new project with optional repository associations.",
+	inputSchema: {
+		type: "object",
+		properties: {
+			name: {
+				type: "string",
+				description: "Project name (required)",
+			},
+			description: {
+				type: "string",
+				description: "Project description (optional)",
+			},
+			repository_ids: {
+				type: "array",
+				items: { type: "string" },
+				description: "Optional: Repository UUIDs to associate with project",
+			},
+		},
+		required: ["name"],
+	},
+};
+
+/**
+ * Tool: list_projects
+ */
+export const LIST_PROJECTS_TOOL: ToolDefinition = {
+	name: "list_projects",
+	description: "List all projects for the authenticated user with repository counts.",
+	inputSchema: {
+		type: "object",
+		properties: {
+			limit: {
+				type: "number",
+				description: "Optional: Maximum projects to return (default: unlimited)",
+			},
+		},
+	},
+};
+
+/**
+ * Tool: get_project
+ */
+export const GET_PROJECT_TOOL: ToolDefinition = {
+	name: "get_project",
+	description: "Get project details with full repository list. Accepts project UUID or name.",
+	inputSchema: {
+		type: "object",
+		properties: {
+			project: {
+				type: "string",
+				description: "Project UUID or name (case-insensitive)",
+			},
+		},
+		required: ["project"],
+	},
+};
+
+/**
+ * Tool: update_project
+ */
+export const UPDATE_PROJECT_TOOL: ToolDefinition = {
+	name: "update_project",
+	description: "Update project name, description, and/or repository associations.",
+	inputSchema: {
+		type: "object",
+		properties: {
+			project: {
+				type: "string",
+				description: "Project UUID or name (case-insensitive)",
+			},
+			name: {
+				type: "string",
+				description: "Optional: New project name",
+			},
+			description: {
+				type: "string",
+				description: "Optional: New project description",
+			},
+			repository_ids: {
+				type: "array",
+				items: { type: "string" },
+				description: "Optional: Repository UUIDs (replaces all associations)",
+			},
+		},
+		required: ["project"],
+	},
+};
+
+/**
+ * Tool: delete_project
+ */
+export const DELETE_PROJECT_TOOL: ToolDefinition = {
+	name: "delete_project",
+	description: "Delete project (cascade deletes associations, repositories remain indexed).",
+	inputSchema: {
+		type: "object",
+		properties: {
+			project: {
+				type: "string",
+				description: "Project UUID or name (case-insensitive)",
+			},
+		},
+		required: ["project"],
+	},
+};
+
+/**
+ * Tool: add_repository_to_project
+ */
+export const ADD_REPOSITORY_TO_PROJECT_TOOL: ToolDefinition = {
+	name: "add_repository_to_project",
+	description: "Add a repository to a project (idempotent).",
+	inputSchema: {
+		type: "object",
+		properties: {
+			project: {
+				type: "string",
+				description: "Project UUID or name (case-insensitive)",
+			},
+			repository_id: {
+				type: "string",
+				description: "Repository UUID to add",
+			},
+		},
+		required: ["project", "repository_id"],
+	},
+};
+
+/**
+ * Tool: remove_repository_from_project
+ */
+export const REMOVE_REPOSITORY_FROM_PROJECT_TOOL: ToolDefinition = {
+	name: "remove_repository_from_project",
+	description: "Remove a repository from a project (idempotent).",
+	inputSchema: {
+		type: "object",
+		properties: {
+			project: {
+				type: "string",
+				description: "Project UUID or name (case-insensitive)",
+			},
+			repository_id: {
+				type: "string",
+				description: "Repository UUID to remove",
+			},
+		},
+		required: ["project", "repository_id"],
+	},
+};
+
+/**
+ * Tool: get_index_job_status
+ */
+export const GET_INDEX_JOB_STATUS_TOOL: ToolDefinition = {
+	name: "get_index_job_status",
+	description: `Query the status of an indexing job by run_id. Returns current status, progress stats, and completion details.
+
+Poll this tool every 5-10 seconds to track job progress. Stop polling when status is 'completed', 'failed', or 'skipped'.
+
+Typical indexing times:
+- Small repos (<100 files): 10-30 seconds
+- Medium repos (100-1000 files): 30-120 seconds
+- Large repos (>1000 files): 2-10 minutes
+
+RLS enforced: You can only query jobs you created.`,
+	inputSchema: {
+		type: "object",
+		properties: {
+			run_id: {
+				type: "string",
+				description: "The UUID of the indexing job (returned by index_repository)",
+			},
+		},
+		required: ["run_id"],
+	},
+};
+
+/**
  * Get all available tool definitions
  */
 export function getToolDefinitions(): ToolDefinition[] {
@@ -296,6 +482,14 @@ export function getToolDefinitions(): ToolDefinition[] {
 		SEARCH_DEPENDENCIES_TOOL,
 		ANALYZE_CHANGE_IMPACT_TOOL,
 		VALIDATE_IMPLEMENTATION_SPEC_TOOL,
+		CREATE_PROJECT_TOOL,
+		LIST_PROJECTS_TOOL,
+		GET_PROJECT_TOOL,
+		UPDATE_PROJECT_TOOL,
+		DELETE_PROJECT_TOOL,
+		ADD_REPOSITORY_TO_PROJECT_TOOL,
+		REMOVE_REPOSITORY_FROM_PROJECT_TOOL,
+		GET_INDEX_JOB_STATUS_TOOL,
 	];
 }
 
@@ -308,32 +502,91 @@ function isSearchParams(
 	if (typeof params !== "object" || params === null) return false;
 	const p = params as Record<string, unknown>;
 	if (typeof p.term !== "string") return false;
-	if (p.repository !== undefined && typeof p.repository !== "string")
-		return false;
+	if (p.project !== undefined && typeof p.project !== "string") return false;
+	if (p.repository !== undefined && typeof p.repository !== "string") return false;
 	if (p.limit !== undefined && typeof p.limit !== "number") return false;
 	return true;
 }
 
-function isIndexParams(
-	params: unknown,
-): params is { repository: string; ref?: string; localPath?: string } {
+function isIndexParams(params: unknown): params is { repository: string; ref?: string } {
 	if (typeof params !== "object" || params === null) return false;
 	const p = params as Record<string, unknown>;
 	if (typeof p.repository !== "string") return false;
 	if (p.ref !== undefined && typeof p.ref !== "string") return false;
-	if (p.localPath !== undefined && typeof p.localPath !== "string")
-		return false;
 	return true;
 }
 
-function isListRecentParams(
-	params: unknown,
-): params is { limit?: number } | undefined {
+function isListRecentParams(params: unknown): params is { limit?: number } | undefined {
 	if (params === undefined) return true;
 	if (typeof params !== "object" || params === null) return false;
 	const p = params as Record<string, unknown>;
 	if (p.limit !== undefined && typeof p.limit !== "number") return false;
 	return true;
+}
+
+/**
+ * Resolve project identifier (UUID or name) to project UUID.
+ * Supports both UUID and case-insensitive name lookups.
+ *
+ * @param supabase - Supabase client instance
+ * @param userId - User UUID for RLS context
+ * @param projectIdentifier - Project UUID or name
+ * @returns Project UUID or throws "Project not found" error
+ */
+async function resolveProjectId(
+	supabase: SupabaseClient,
+	userId: string,
+	projectIdentifier: string,
+): Promise<string> {
+	// Try UUID regex match first
+	const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+	if (uuidRegex.test(projectIdentifier)) {
+		// Direct UUID lookup
+		const { data: project, error } = await supabase
+			.from("projects")
+			.select("id")
+			.eq("id", projectIdentifier)
+			.eq("user_id", userId)
+			.maybeSingle();
+
+		if (error) {
+			logger.error("Failed to fetch project by UUID", {
+				error: error.message,
+				project: projectIdentifier,
+				user_id: userId,
+			});
+			throw new Error(`Failed to fetch project: ${error.message}`);
+		}
+
+		if (!project) {
+			throw new Error(`Project not found: ${projectIdentifier}`);
+		}
+
+		return project.id;
+	}
+
+	// Lookup by name (case-insensitive)
+	const { data: project, error } = await supabase
+		.from("projects")
+		.select("id")
+		.eq("user_id", userId)
+		.ilike("name", projectIdentifier)
+		.maybeSingle();
+
+	if (error) {
+		logger.error("Failed to fetch project by name", {
+			error: error.message,
+			project: projectIdentifier,
+			user_id: userId,
+		});
+		throw new Error(`Failed to fetch project: ${error.message}`);
+	}
+
+	if (!project) {
+		throw new Error(`Project not found: ${projectIdentifier}`);
+	}
+
+	return project.id;
 }
 
 /**
@@ -361,6 +614,9 @@ export async function executeSearchCode(
 	}
 
 	// Validate optional parameters
+	if (p.project !== undefined && typeof p.project !== "string") {
+		throw new Error("Parameter 'project' must be a string");
+	}
 	if (p.repository !== undefined && typeof p.repository !== "string") {
 		throw new Error("Parameter 'repository' must be a string");
 	}
@@ -368,13 +624,21 @@ export async function executeSearchCode(
 		throw new Error("Parameter 'limit' must be a number");
 	}
 
+	// Resolve project identifier to UUID if provided
+	let projectId: string | undefined;
+	if (p.project) {
+		projectId = await resolveProjectId(supabase, userId, p.project as string);
+	}
+
 	const validatedParams = p as {
 		term: string;
+		project?: string;
 		repository?: string;
 		limit?: number;
 	};
 
 	const results = await searchFiles(supabase, validatedParams.term, userId, {
+		projectId,
 		repositoryId: validatedParams.repository,
 		limit: validatedParams.limit,
 	});
@@ -418,44 +682,55 @@ export async function executeIndexRepository(
 	if (p.ref !== undefined && typeof p.ref !== "string") {
 		throw new Error("Parameter 'ref' must be a string");
 	}
-	if (p.localPath !== undefined && typeof p.localPath !== "string") {
-		throw new Error("Parameter 'localPath' must be a string");
+
+	// Reject localPath parameter - no longer supported
+	if (p.localPath !== undefined) {
+		throw new Error(
+			"Parameter 'localPath' is no longer supported. The MCP server only accepts remote git repositories.",
+		);
 	}
 
 	const validatedParams = p as {
 		repository: string;
 		ref?: string;
-		localPath?: string;
 	};
 
 	const indexRequest: IndexRequest = {
 		repository: validatedParams.repository,
 		ref: validatedParams.ref ?? "main", // Default to 'main' if not provided
-		localPath: validatedParams.localPath,
 	};
 
 	// Ensure repository exists in database
 	const repositoryId = await ensureRepository(supabase, userId, indexRequest);
-	const runId = await recordIndexRun(
-		supabase,
-		indexRequest,
-		userId,
-		repositoryId,
-	);
+	const runId = await recordIndexRun(supabase, indexRequest, userId, repositoryId);
 
 	// Queue async indexing workflow
 	queueMicrotask(() =>
-		runIndexingWorkflow(
-			supabase,
-			indexRequest,
-			runId,
-			userId,
-			repositoryId,
-		).catch((error) => {
-			process.stderr.write(`Indexing workflow failed: ${JSON.stringify(error)}\n`);
-			updateIndexRunStatus(supabase, runId, "failed", error.message).catch(
-				(err) => process.stderr.write(`Failed to update index run status: ${JSON.stringify(err)}\n`),
+		runIndexingWorkflow(supabase, indexRequest, runId, userId, repositoryId).catch((error) => {
+			logger.error(
+				"Indexing workflow failed",
+				error instanceof Error ? error : new Error(String(error)),
+				{
+					run_id: runId,
+					user_id: userId,
+					repository_id: repositoryId,
+				},
 			);
+			Sentry.captureException(error, {
+				tags: { run_id: runId, user_id: userId, repository_id: repositoryId },
+			});
+			updateIndexRunStatus(supabase, runId, "failed", error.message).catch((err) => {
+				logger.error(
+					"Failed to update index run status",
+					err instanceof Error ? err : new Error(String(err)),
+					{
+						run_id: runId,
+					},
+				);
+				Sentry.captureException(err, {
+					tags: { run_id: runId },
+				});
+			});
 		}),
 	);
 
@@ -476,16 +751,11 @@ export async function executeListRecentFiles(
 	userId: string,
 ): Promise<unknown> {
 	if (!isListRecentParams(params)) {
-		throw invalidParams(
-			requestId,
-			"Invalid parameters for list_recent_files tool",
-		);
+		throw invalidParams(requestId, "Invalid parameters for list_recent_files tool");
 	}
 
 	const limit =
-		params && typeof params === "object" && "limit" in params
-			? (params.limit as number)
-			: 10;
+		params && typeof params === "object" && "limit" in params ? (params.limit as number) : 10;
 	const files = await listRecentFiles(supabase, limit, userId);
 
 	return {
@@ -528,9 +798,7 @@ export async function executeSearchDependencies(
 		typeof p.direction === "string" &&
 		!["dependents", "dependencies", "both"].includes(p.direction)
 	) {
-		throw new Error(
-			"Parameter 'direction' must be one of: dependents, dependencies, both",
-		);
+		throw new Error("Parameter 'direction' must be one of: dependents, dependencies, both");
 	}
 
 	if (p.depth !== undefined) {
@@ -584,12 +852,7 @@ export async function executeSearchDependencies(
 	}
 
 	// Resolve file path to file ID
-	const fileId = await resolveFilePath(
-		supabase,
-		validatedParams.file_path,
-		repositoryId,
-		userId,
-	);
+	const fileId = await resolveFilePath(supabase, validatedParams.file_path, repositoryId, userId);
 
 	if (!fileId) {
 		return {
@@ -604,10 +867,7 @@ export async function executeSearchDependencies(
 	let dependents: DependencyResult | null = null;
 	let dependencies: DependencyResult | null = null;
 
-	if (
-		validatedParams.direction === "dependents" ||
-		validatedParams.direction === "both"
-	) {
+	if (validatedParams.direction === "dependents" || validatedParams.direction === "both") {
 		dependents = await queryDependents(
 			supabase,
 			fileId,
@@ -617,16 +877,8 @@ export async function executeSearchDependencies(
 		);
 	}
 
-	if (
-		validatedParams.direction === "dependencies" ||
-		validatedParams.direction === "both"
-	) {
-		dependencies = await queryDependencies(
-			supabase,
-			fileId,
-			validatedParams.depth,
-			userId,
-		);
+	if (validatedParams.direction === "dependencies" || validatedParams.direction === "both") {
+		dependencies = await queryDependencies(supabase, fileId, validatedParams.depth, userId);
 	}
 
 	// Build response
@@ -643,10 +895,7 @@ export async function executeSearchDependencies(
 			cycles: dependents.cycles,
 			count:
 				dependents.direct.length +
-				Object.values(dependents.indirect).reduce(
-					(sum, arr) => sum + arr.length,
-					0,
-				),
+				Object.values(dependents.indirect).reduce((sum, arr) => sum + arr.length, 0),
 		};
 	}
 
@@ -657,10 +906,7 @@ export async function executeSearchDependencies(
 			cycles: dependencies.cycles,
 			count:
 				dependencies.direct.length +
-				Object.values(dependencies.indirect).reduce(
-					(sum, arr) => sum + arr.length,
-					0,
-				),
+				Object.values(dependencies.indirect).reduce((sum, arr) => sum + arr.length, 0),
 		};
 	}
 
@@ -691,9 +937,7 @@ export async function executeAnalyzeChangeImpact(
 		throw new Error("Parameter 'change_type' must be a string");
 	}
 	if (!["feature", "refactor", "fix", "chore"].includes(p.change_type)) {
-		throw new Error(
-			"Parameter 'change_type' must be one of: feature, refactor, fix, chore",
-		);
+		throw new Error("Parameter 'change_type' must be one of: feature, refactor, fix, chore");
 	}
 
 	if (p.description === undefined) {
@@ -713,10 +957,7 @@ export async function executeAnalyzeChangeImpact(
 	if (p.files_to_delete !== undefined && !Array.isArray(p.files_to_delete)) {
 		throw new Error("Parameter 'files_to_delete' must be an array");
 	}
-	if (
-		p.breaking_changes !== undefined &&
-		typeof p.breaking_changes !== "boolean"
-	) {
+	if (p.breaking_changes !== undefined && typeof p.breaking_changes !== "boolean") {
 		throw new Error("Parameter 'breaking_changes' must be a boolean");
 	}
 	if (p.repository !== undefined && typeof p.repository !== "string") {
@@ -733,11 +974,7 @@ export async function executeAnalyzeChangeImpact(
 		repository: p.repository as string | undefined,
 	};
 
-	const result = await analyzeChangeImpact(
-		supabase,
-		validatedParams,
-		userId,
-	);
+	const result = await analyzeChangeImpact(supabase, validatedParams, userId);
 
 	return result;
 }
@@ -776,16 +1013,10 @@ export async function executeValidateImplementationSpec(
 	if (p.migrations !== undefined && !Array.isArray(p.migrations)) {
 		throw new Error("Parameter 'migrations' must be an array");
 	}
-	if (
-		p.dependencies_to_add !== undefined &&
-		!Array.isArray(p.dependencies_to_add)
-	) {
+	if (p.dependencies_to_add !== undefined && !Array.isArray(p.dependencies_to_add)) {
 		throw new Error("Parameter 'dependencies_to_add' must be an array");
 	}
-	if (
-		p.breaking_changes !== undefined &&
-		typeof p.breaking_changes !== "boolean"
-	) {
+	if (p.breaking_changes !== undefined && typeof p.breaking_changes !== "boolean") {
 		throw new Error("Parameter 'breaking_changes' must be a boolean");
 	}
 	if (p.repository !== undefined && typeof p.repository !== "string") {
@@ -802,13 +1033,392 @@ export async function executeValidateImplementationSpec(
 		repository: p.repository as string | undefined,
 	};
 
-	const result = await validateImplementationSpec(
-		supabase,
-		validatedParams,
-		userId,
-	);
+	const result = await validateImplementationSpec(supabase, validatedParams, userId);
 
 	return result;
+}
+
+/**
+ * Execute create_project tool
+ */
+export async function executeCreateProject(
+	supabase: SupabaseClient,
+	params: unknown,
+	_requestId: string | number,
+	userId: string,
+): Promise<unknown> {
+	// Validate params structure
+	if (typeof params !== "object" || params === null) {
+		throw new Error("Parameters must be an object");
+	}
+
+	const p = params as Record<string, unknown>;
+
+	// Check required parameter: name
+	if (p.name === undefined) {
+		throw new Error("Missing required parameter: name");
+	}
+	if (typeof p.name !== "string") {
+		throw new Error("Parameter 'name' must be a string");
+	}
+
+	// Validate optional parameters
+	if (p.description !== undefined && typeof p.description !== "string") {
+		throw new Error("Parameter 'description' must be a string");
+	}
+	if (p.repository_ids !== undefined && !Array.isArray(p.repository_ids)) {
+		throw new Error("Parameter 'repository_ids' must be an array");
+	}
+
+	// Set RLS context before database operations
+	await setUserContext(supabase, userId);
+
+	const projectId = await createProject(supabase, userId, {
+		name: p.name as string,
+		description: p.description as string | undefined,
+		repository_ids: p.repository_ids as string[] | undefined,
+	});
+
+	return {
+		projectId,
+		name: p.name,
+	};
+}
+
+/**
+ * Execute list_projects tool
+ */
+export async function executeListProjects(
+	supabase: SupabaseClient,
+	params: unknown,
+	_requestId: string | number,
+	userId: string,
+): Promise<unknown> {
+	// Validate params structure (all params are optional)
+	if (params !== undefined && (typeof params !== "object" || params === null)) {
+		throw new Error("Parameters must be an object");
+	}
+
+	// Set RLS context before database operations
+	await setUserContext(supabase, userId);
+
+	const projects = await listProjects(supabase, userId);
+
+	// Apply limit if provided
+	if (params && typeof params === "object") {
+		const p = params as Record<string, unknown>;
+		if (p.limit !== undefined) {
+			if (typeof p.limit !== "number") {
+				throw new Error("Parameter 'limit' must be a number");
+			}
+			return { projects: projects.slice(0, p.limit) };
+		}
+	}
+
+	return { projects };
+}
+
+/**
+ * Execute get_project tool
+ */
+export async function executeGetProject(
+	supabase: SupabaseClient,
+	params: unknown,
+	_requestId: string | number,
+	userId: string,
+): Promise<unknown> {
+	// Validate params structure
+	if (typeof params !== "object" || params === null) {
+		throw new Error("Parameters must be an object");
+	}
+
+	const p = params as Record<string, unknown>;
+
+	// Check required parameter: project
+	if (p.project === undefined) {
+		throw new Error("Missing required parameter: project");
+	}
+	if (typeof p.project !== "string") {
+		throw new Error("Parameter 'project' must be a string");
+	}
+
+	// Set RLS context before database operations
+	await setUserContext(supabase, userId);
+
+	// Resolve project identifier
+	const projectId = await resolveProjectId(supabase, userId, p.project as string);
+
+	// Get project details
+	const project = await getProject(supabase, userId, projectId);
+
+	if (!project) {
+		throw new Error(`Project not found: ${p.project}`);
+	}
+
+	return project;
+}
+
+/**
+ * Execute update_project tool
+ */
+export async function executeUpdateProject(
+	supabase: SupabaseClient,
+	params: unknown,
+	_requestId: string | number,
+	userId: string,
+): Promise<unknown> {
+	// Validate params structure
+	if (typeof params !== "object" || params === null) {
+		throw new Error("Parameters must be an object");
+	}
+
+	const p = params as Record<string, unknown>;
+
+	// Check required parameter: project
+	if (p.project === undefined) {
+		throw new Error("Missing required parameter: project");
+	}
+	if (typeof p.project !== "string") {
+		throw new Error("Parameter 'project' must be a string");
+	}
+
+	// Validate at least one update field is present
+	if (p.name === undefined && p.description === undefined && p.repository_ids === undefined) {
+		throw new Error("At least one update field required: name, description, or repository_ids");
+	}
+
+	// Validate optional parameters
+	if (p.name !== undefined && typeof p.name !== "string") {
+		throw new Error("Parameter 'name' must be a string");
+	}
+	if (p.description !== undefined && typeof p.description !== "string") {
+		throw new Error("Parameter 'description' must be a string");
+	}
+	if (p.repository_ids !== undefined && !Array.isArray(p.repository_ids)) {
+		throw new Error("Parameter 'repository_ids' must be an array");
+	}
+
+	// Set RLS context before database operations
+	await setUserContext(supabase, userId);
+
+	// Resolve project identifier
+	const projectId = await resolveProjectId(supabase, userId, p.project as string);
+
+	// Update project
+	await updateProject(supabase, userId, projectId, {
+		name: p.name as string | undefined,
+		description: p.description as string | undefined,
+		repository_ids: p.repository_ids as string[] | undefined,
+	});
+
+	return {
+		success: true,
+		message: "Project updated",
+	};
+}
+
+/**
+ * Execute delete_project tool
+ */
+export async function executeDeleteProject(
+	supabase: SupabaseClient,
+	params: unknown,
+	_requestId: string | number,
+	userId: string,
+): Promise<unknown> {
+	// Validate params structure
+	if (typeof params !== "object" || params === null) {
+		throw new Error("Parameters must be an object");
+	}
+
+	const p = params as Record<string, unknown>;
+
+	// Check required parameter: project
+	if (p.project === undefined) {
+		throw new Error("Missing required parameter: project");
+	}
+	if (typeof p.project !== "string") {
+		throw new Error("Parameter 'project' must be a string");
+	}
+
+	// Set RLS context before database operations
+	await setUserContext(supabase, userId);
+
+	// Resolve project identifier
+	const projectId = await resolveProjectId(supabase, userId, p.project as string);
+
+	// Delete project
+	await deleteProject(supabase, userId, projectId);
+
+	return {
+		success: true,
+		message: "Project deleted",
+	};
+}
+
+/**
+ * Execute add_repository_to_project tool
+ */
+export async function executeAddRepositoryToProject(
+	supabase: SupabaseClient,
+	params: unknown,
+	_requestId: string | number,
+	userId: string,
+): Promise<unknown> {
+	// Validate params structure
+	if (typeof params !== "object" || params === null) {
+		throw new Error("Parameters must be an object");
+	}
+
+	const p = params as Record<string, unknown>;
+
+	// Check required parameters
+	if (p.project === undefined) {
+		throw new Error("Missing required parameter: project");
+	}
+	if (typeof p.project !== "string") {
+		throw new Error("Parameter 'project' must be a string");
+	}
+	if (p.repository_id === undefined) {
+		throw new Error("Missing required parameter: repository_id");
+	}
+	if (typeof p.repository_id !== "string") {
+		throw new Error("Parameter 'repository_id' must be a string");
+	}
+
+	// Set RLS context before database operations
+	await setUserContext(supabase, userId);
+
+	// Resolve project identifier
+	const projectId = await resolveProjectId(supabase, userId, p.project as string);
+
+	// Verify repository exists and belongs to user
+	const { data: repository, error: repoError } = await supabase
+		.from("repositories")
+		.select("id")
+		.eq("id", p.repository_id)
+		.eq("user_id", userId)
+		.maybeSingle();
+
+	if (repoError) {
+		logger.error("Failed to fetch repository", {
+			error: repoError.message,
+			repository_id: p.repository_id,
+			user_id: userId,
+		});
+		throw new Error(`Failed to fetch repository: ${repoError.message}`);
+	}
+
+	if (!repository) {
+		throw new Error(`Repository not found: ${p.repository_id}`);
+	}
+
+	// Add repository to project
+	await addRepositoryToProject(supabase, userId, projectId, p.repository_id as string);
+
+	return {
+		success: true,
+		message: "Repository added to project",
+	};
+}
+
+/**
+ * Execute remove_repository_from_project tool
+ */
+export async function executeRemoveRepositoryFromProject(
+	supabase: SupabaseClient,
+	params: unknown,
+	_requestId: string | number,
+	userId: string,
+): Promise<unknown> {
+	// Validate params structure
+	if (typeof params !== "object" || params === null) {
+		throw new Error("Parameters must be an object");
+	}
+
+	const p = params as Record<string, unknown>;
+
+	// Check required parameters
+	if (p.project === undefined) {
+		throw new Error("Missing required parameter: project");
+	}
+	if (typeof p.project !== "string") {
+		throw new Error("Parameter 'project' must be a string");
+	}
+	if (p.repository_id === undefined) {
+		throw new Error("Missing required parameter: repository_id");
+	}
+	if (typeof p.repository_id !== "string") {
+		throw new Error("Parameter 'repository_id' must be a string");
+	}
+
+	// Set RLS context before database operations
+	await setUserContext(supabase, userId);
+
+	// Resolve project identifier
+	const projectId = await resolveProjectId(supabase, userId, p.project as string);
+
+	// Remove repository from project
+	await removeRepositoryFromProject(supabase, userId, projectId, p.repository_id as string);
+
+	return {
+		success: true,
+		message: "Repository removed from project",
+	};
+}
+
+/**
+ * Execute get_index_job_status tool
+ */
+export async function executeGetIndexJobStatus(
+	supabase: SupabaseClient,
+	params: unknown,
+	_requestId: string | number,
+	userId: string,
+): Promise<unknown> {
+	// Validate params structure
+	if (typeof params !== "object" || params === null) {
+		throw new Error("Parameters must be an object");
+	}
+
+	const p = params as Record<string, unknown>;
+
+	// Check required parameter: run_id
+	if (p.run_id === undefined) {
+		throw new Error("Missing required parameter: run_id");
+	}
+	if (typeof p.run_id !== "string") {
+		throw new Error("Parameter 'run_id' must be a string");
+	}
+
+	// Validate UUID format
+	const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+	if (!uuidRegex.test(p.run_id)) {
+		throw new Error("Parameter 'run_id' must be a valid UUID");
+	}
+
+	// Set RLS context before query
+	await setUserContext(supabase, userId);
+
+	// Query job status (RLS enforced via supabase client)
+	const job = await getIndexJobStatus(supabase, p.run_id);
+
+	if (!job) {
+		throw new Error("Job not found or access denied");
+	}
+
+	return {
+		run_id: job.id,
+		status: job.status,
+		repository_id: job.repository_id,
+		ref: job.ref,
+		started_at: job.started_at,
+		completed_at: job.completed_at,
+		error_message: job.error_message,
+		stats: job.stats,
+		retry_count: job.retry_count,
+		created_at: job.created_at,
+	};
 }
 
 /**
@@ -829,26 +1439,27 @@ export async function handleToolCall(
 		case "list_recent_files":
 			return await executeListRecentFiles(supabase, params, requestId, userId);
 		case "search_dependencies":
-			return await executeSearchDependencies(
-				supabase,
-				params,
-				requestId,
-				userId,
-			);
+			return await executeSearchDependencies(supabase, params, requestId, userId);
 		case "analyze_change_impact":
-			return await executeAnalyzeChangeImpact(
-				supabase,
-				params,
-				requestId,
-				userId,
-			);
+			return await executeAnalyzeChangeImpact(supabase, params, requestId, userId);
 		case "validate_implementation_spec":
-			return await executeValidateImplementationSpec(
-				supabase,
-				params,
-				requestId,
-				userId,
-			);
+			return await executeValidateImplementationSpec(supabase, params, requestId, userId);
+		case "create_project":
+			return await executeCreateProject(supabase, params, requestId, userId);
+		case "list_projects":
+			return await executeListProjects(supabase, params, requestId, userId);
+		case "get_project":
+			return await executeGetProject(supabase, params, requestId, userId);
+		case "update_project":
+			return await executeUpdateProject(supabase, params, requestId, userId);
+		case "delete_project":
+			return await executeDeleteProject(supabase, params, requestId, userId);
+		case "add_repository_to_project":
+			return await executeAddRepositoryToProject(supabase, params, requestId, userId);
+		case "remove_repository_from_project":
+			return await executeRemoveRepositoryFromProject(supabase, params, requestId, userId);
+		case "get_index_job_status":
+			return await executeGetIndexJobStatus(supabase, params, requestId, userId);
 		default:
 			throw invalidParams(requestId, `Unknown tool: ${toolName}`);
 	}

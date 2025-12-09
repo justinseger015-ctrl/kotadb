@@ -1,5 +1,8 @@
 # Conditional Documentation Guide - Application Layer
 
+**Template Category**: Message-Only
+**Prompt Level**: 1 (Static)
+
 Use this reference to decide which KotaDB application layer documentation sources to consult before you start working on backend/API features, database schema, testing, or CI infrastructure. Read only the docs whose conditions match your task so you stay efficient.
 
 ## Instructions
@@ -71,8 +74,9 @@ Use this reference to decide which KotaDB application layer documentation source
     - When working with MCP server architecture or tool implementations
     - When understanding MCP SDK behavior (content blocks, error codes, HTTP status codes)
     - When writing MCP tests or troubleshooting MCP tool execution
-    - When implementing new MCP tools (search_code, index_repository, list_recent_files, search_dependencies)
+    - When implementing new MCP tools (search_code, index_repository, list_recent_files, search_dependencies, analyze_change_impact, validate_implementation_spec, create_project, list_projects, get_project, update_project, delete_project, add_repository_to_project, remove_repository_from_project)
     - When debugging SDK error handling or response format issues
+    - When working with project management features via MCP (create, list, get, update, delete projects; add/remove repositories)
 
 - .claude/commands/docs/mcp-usage-guidance.md
   - Conditions:
@@ -209,6 +213,16 @@ Use this reference to decide which KotaDB application layer documentation source
     - When onboarding developers who need to understand migration file naming conventions
     - When experiencing merge conflicts in migration directories during concurrent development
     - When Supabase CLI fails to recognize or apply migrations due to naming issues
+
+- docs/specs/chore-471-open-source-core-fork.md
+  - Conditions:
+    - When working on billing features or Stripe integration in open source fork
+    - When implementing or troubleshooting ENABLE_BILLING feature flag behavior
+    - When understanding public vs private repository split and sync strategy
+    - When configuring billing endpoints to return 501 when billing disabled
+    - When setting up self-hosted deployments without billing features
+    - When documenting Stripe integration as educational example code
+    - When working with GitHub Actions sync workflow to public repository
 
 - docs/specs/feature-317-dev-session-endpoint.md
   - Conditions:
@@ -395,3 +409,77 @@ Use this reference to decide which KotaDB application layer documentation source
     - When enhancing output format specifications or adding CRITICAL output sections
     - When agents add explanatory text despite templates specifying "Return only X"
     - When implementing defensive parsing patterns for agent responses
+
+- .claude/commands/release/release.md
+  - Conditions:
+    - When creating a production release by merging develop → main
+    - When performing version bumping (major/minor/patch)
+    - When generating changelogs from commit history
+    - When validating pre-release checks (CI, migration sync, schema parity, health checks)
+    - When creating release PRs with comprehensive checklists
+    - When tagging releases and creating GitHub releases
+    - When syncing develop with main after release
+    - When handling emergency hotfixes from main branch
+    - When implementing rollback procedures for problematic releases
+    - When understanding semantic versioning strategy for KotaDB
+
+- .claude/commands/experts/ (Expert System)
+  - Conditions:
+    - When needing multi-perspective analysis for feature planning
+    - When performing comprehensive code review across domains
+    - When analyzing architecture, testing, security, or integration concerns
+    - When using Planning Council for synthesized planning recommendations
+    - When using Review Panel for consolidated code review decisions
+    - When running expert self-improvement to update domain knowledge
+  - Available Experts:
+    - architecture-expert: Path aliases, component boundaries, data flow patterns
+    - testing-expert: Antimocking philosophy, test patterns, coverage requirements
+    - security-expert: RLS policies, authentication flow, input validation
+    - integration-expert: MCP server patterns, Supabase integration, external APIs
+    - ux-expert: CLI output formatting, error messages, progress indicators, accessibility
+    - cc_hook_expert: Claude Code hooks, pre-commit automation, hook configuration patterns
+    - claude-config: CLAUDE.md structure, settings.json, MCP configuration, command organization
+  - Orchestrators:
+    - planning_council: Multi-expert planning synthesis
+    - review_panel: Multi-expert code review aggregation
+    - improve_orchestrators: Self-improvement for orchestrator coordination patterns
+
+- .claude/hooks/ (Automation Hooks)
+  - Conditions:
+    - When understanding automatic quality enforcement for TypeScript/JavaScript files
+    - When troubleshooting PostToolUse or UserPromptSubmit hook behavior
+    - When modifying or adding new automation hooks
+    - When debugging hook timeout or execution errors
+  - Components:
+    - auto_linter.py: PostToolUse hook for auto-linting after Write/Edit on .ts/.js files
+    - context_builder.py: UserPromptSubmit hook for contextual documentation suggestions
+    - utils/hook_helpers.py: Shared utilities for JSON I/O, file detection, project root
+  - Configuration:
+    - .claude/settings.json: Hook configuration with matchers and timeouts
+    - PostToolUse: Triggers on Write|Edit, runs Biome linter (45s timeout)
+    - UserPromptSubmit: Triggers on all prompts, provides context hints (10s timeout)
+
+- .claude/commands/docs/settings-configuration.md
+  - Conditions:
+    - When configuring Claude Code settings for KotaDB development
+    - When setting up permission patterns for Bash or MCP tools
+    - When creating or customizing settings.local.json for personal preferences
+    - When troubleshooting status line display or permission issues
+    - When understanding the difference between shared and local settings
+    - When auditing or reviewing Claude Code permission security
+  - Components:
+    - settings.json: Shared project settings (statusLine, hooks)
+    - settings.local.json: Personal settings (gitignored)
+    - settings.local.json.template: Template for local settings setup
+    - statusline.py: Status line script showing project and branch
+
+- .claude/docs/prompt-levels.md
+  - Conditions:
+    - When understanding the 7-level prompt maturity model for slash commands
+    - When classifying command complexity or composability
+    - When designing new slash commands and determining appropriate level
+    - When working with expert system commands (Level 5-7)
+    - When implementing self-modifying commands that update their own content
+    - When implementing meta-cognitive commands that improve other commands
+    - When adding Expertise sections to commands
+    - When understanding Template Category requirements by prompt level
